@@ -318,7 +318,10 @@
         <p>${reconnect
           ? "The browser needs you to re-confirm read permission on the saved folder."
           : "The first time you need to pick a folder manually. It's remembered after that."}</p>
-        <button class="primary" id="pickBtn">${reconnect ? "Reconnect" : "📁 Select folder"}</button>
+        <div class="picker-actions">
+          <button class="primary" id="pickBtn">${reconnect ? "Reconnect" : "📁 Select folder"}</button>
+          ${reconnect ? "" : `<a class="button-like" id="githubLink" href="https://github.com/wramirezrg/siganor-search" target="_blank" rel="noopener noreferrer">⭐ View on GitHub</a>`}
+        </div>
         <p class="fine-print">${reconnect
           ? "Your browser asks for this every time it opens this page. That's normal, and nothing was lost; your files were never uploaded anywhere, they stay on your device. Press Enter to reconnect instantly."
           : "🔒 Everything stays on your device. Nothing is ever uploaded, no account needed, no server involved."}</p>
