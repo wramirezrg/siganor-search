@@ -27,26 +27,28 @@
   const PREVIEWABLE = new Set(["pdf","png","jpg","jpeg","gif","webp","txt","htm","html"]);
   const STOPWORDS = new Set(["de","la","el","los","las","en","del","para","con","por","un","una","y","the","and","of","for","en-p","en-e","pdf","doc","manual","guide","user","instructions"]);
 
-  let rootHandle = null;
-  let folders = [];            // [{ id, name, handle, addedAt, lastScanAt }]
-  let activeFolderId = null;
-  let allFiles = [];
+  let folders = [];            // [{ id, name, handle, addedAt, lastScanAt }] — every linked folder, always in scope
+  let folderPermissionState = new Map(); // folderId -> "granted" | "needs-reconnect" | "error"
+  let activeFolderFilterId = null; // cosmetic sidebar toggle; null = show results from every linked folder
+  let allFiles = [];            // merged across every linked folder; each entry carries folderId/folderName
   let activeCategory = ALL_VALUE;
   let lastScanAt = null;
-  let favoritesMap = {};       // { [path]: favoritedAtTs }
+  let favoritesMap = {};       // { [fileKey]: favoritedAtTs } — merged in memory, persisted per-folder on disk
   let favoritesOnly = false;
-  let collections = [];        // [{ id, name, createdAt, paths: [] }]
+  let collections = [];        // [{ id, folderId, name, createdAt, paths: [] }] — merged across folders, each still scoped to one
   let activeCollectionId = null;
-  let textIndex = new Map();   // path -> extracted text (in-memory, loaded from STORE_TEXT_INDEX)
+  let textIndex = new Map();   // fileKey -> extracted text record (in-memory, loaded from STORE_TEXT_INDEX)
   let indexQueueTotal = 0;
   let indexQueueDone = 0;
   let indexingActive = false;
-  let hashIndex = new Map();   // path -> { path, hash, size, lastModified, hashedAt }
+  let indexQueuePending = false; // a folder was linked/unlinked mid-run; re-run once this pass finishes
+  let hashIndex = new Map();   // fileKey -> { path, folderId, hash, size, lastModified, hashedAt }
   let hashQueueTotal = 0;
   let hashQueueDone = 0;
   let hashingActive = false;
+  let hashQueuePending = false;
   let duplicateGroups = [];    // [[entry, entry, ...], ...] — groups of 2+ files sharing a hash
-  let scanGeneration = 0;      // bumped by scan()/unlinking; lets stale index/hash loops detect they're obsolete and stop
+  let scanGeneration = 0;      // bumped when the linked-folder set changes; lets stale index/hash loops detect they're obsolete and stop
   let lastResults = [];        // last rendered/filtered results, for keyboard nav + export
   let selectedRowIndex = -1;
   const COLLAPSE_KEY = "docSearchCollapsedCards";
@@ -205,71 +207,123 @@
     folders.sort((a, b) => a.name.localeCompare(b.name));
   }
 
+  async function checkNestedFolder(handle){
+    for (const f of folders){
+      try{
+        if ((await f.handle.resolve(handle)) !== null){
+          return `This folder appears to be inside the already-linked folder "${f.name}". Results may show the same physical file twice. Link anyway?`;
+        }
+        if ((await handle.resolve(f.handle)) !== null){
+          return `The already-linked folder "${f.name}" appears to be inside this folder. Results may show the same physical file twice. Link anyway?`;
+        }
+      }catch(e){ /* resolve() can throw comparing handles from different pickers — ignore, non-fatal */ }
+    }
+    return null;
+  }
+
   async function linkFolder(){
     try{
       const handle = await window.showDirectoryPicker();
       for (const f of folders){
         if (await f.handle.isSameEntry(handle)){
           toast("That folder is already linked.");
-          await setActiveFolder(f.id);
+          activeFolderFilterId = f.id;
+          applyFilters();
+          await renderSidebar();
           return;
         }
       }
+      const nestedWarning = await checkNestedFolder(handle);
+      if (nestedWarning && !confirm(nestedWarning)) return;
+
       const id = crypto.randomUUID();
       await idbSet(STORE_FOLDERS, id, { id, name: handle.name, handle, addedAt: Date.now(), lastScanAt: null });
       await loadFolders();
-      toast("Folder linked: " + handle.name);
-      await setActiveFolder(id);
+      const rec = folders.find(f => f.id === id);
+      toast("Folder linked: " + rec.name);
+
+      setHTML(els.introView, "");
+      els.controlsRow.style.display = "flex";
+      els.layout.style.display = "grid";
+
+      const result = await scanFolder(rec);
+      if (result.ok){
+        allFiles = allFiles.concat(result.files);
+        const favSubset = await idbGet(STORE_FAVORITES, id);
+        if (favSubset){
+          for (const [path, ts] of Object.entries(favSubset)) favoritesMap[id + "::" + path] = ts;
+        }
+        await loadCollections();
+        groupDuplicates();
+        updateTitle();
+        buildCategoryChips();
+        applyFilters();
+        await refreshInsights();
+        runIndexQueue();
+      } else {
+        updateTitle();
+        await renderSidebar();
+        toast(rec.name + " needs permission — click Reconnect in the Folders list.");
+      }
     }catch(e){
       if (e.name !== "AbortError") setStatus("Couldn't open the folder: " + e.message, true);
     }
   }
 
-  async function setActiveFolder(folderId){
+  async function reconnectFolder(folderId){
     const rec = folders.find(f => f.id === folderId);
     if (!rec) return;
-    const perm = await rec.handle.queryPermission({ mode: "read" }).catch(() => "prompt");
-    if (perm !== "granted"){
-      const req = await rec.handle.requestPermission({ mode: "read" }).catch(() => "denied");
-      if (req !== "granted"){ toast("Permission denied for " + rec.name); return; }
+    try{
+      const perm = await rec.handle.requestPermission({ mode: "read" });
+      if (perm !== "granted"){ toast("Permission denied for " + rec.name); return; }
+      const result = await scanFolder(rec);
+      if (result.ok){
+        allFiles = allFiles.filter(f => f.folderId !== rec.id).concat(result.files);
+        groupDuplicates();
+        updateTitle();
+        buildCategoryChips();
+        applyFilters();
+        await refreshInsights();
+        runIndexQueue();
+      } else {
+        await renderSidebar();
+      }
+    }catch(e){
+      toast("Couldn't reconnect: " + e.message);
     }
-    rootHandle = rec.handle;
-    activeFolderId = rec.id;
-    await idbSet(STORE_HANDLES, ACTIVE_KEY, activeFolderId);
-    favoritesMap = {};
-    collections = [];
-    activeCollectionId = null;
-    textIndex = new Map();
-    hashIndex = new Map();
-    duplicateGroups = [];
-    activeCategory = ALL_VALUE;
-    favoritesOnly = false;
-    await scan();
   }
 
   async function unlinkFolder(folderId){
     const rec = folders.find(f => f.id === folderId);
     await idbDelete(STORE_FOLDERS, folderId);
     await loadFolders();
-    if (folderId === activeFolderId){
-      if (folders.length){
-        await setActiveFolder(folders[0].id);
-      } else {
-        rootHandle = null;
-        activeFolderId = null;
-        scanGeneration++;
-        indexingActive = false;
-        hashingActive = false;
-        els.indexStatus.style.display = "none";
-        await idbDelete(STORE_HANDLES, ACTIVE_KEY);
-        els.controlsRow.style.display = "none";
-        setHTML(els.chips, "");
-        renderSelectPrompt(false);
-      }
-    } else {
-      await renderSidebar();
-    }
+    folderPermissionState.delete(folderId);
+    allFiles = allFiles.filter(f => f.folderId !== folderId);
+    for (const k of [...textIndex.keys()]) if (k.startsWith(folderId + "::")) textIndex.delete(k);
+    for (const k of [...hashIndex.keys()]) if (k.startsWith(folderId + "::")) hashIndex.delete(k);
+    for (const k of Object.keys(favoritesMap)) if (k.startsWith(folderId + "::")) delete favoritesMap[k];
+    if (activeFolderFilterId === folderId) activeFolderFilterId = null;
+    scanGeneration++; // safety net: lets any in-flight index/hash pass touching this folder's handles bail out
+    groupDuplicates();
+    updateTitle();
     toast("Folder unlinked" + (rec ? ": " + rec.name : "") + ".");
+
+    if (!folders.length){
+      indexingActive = false;
+      hashingActive = false;
+      indexQueuePending = false;
+      hashQueuePending = false;
+      els.indexStatus.style.display = "none";
+      els.controlsRow.style.display = "none";
+      setHTML(els.chips, "");
+      renderSelectPrompt();
+      return;
+    }
+
+    buildCategoryChips();
+    applyFilters();
+    await refreshInsights();
+    runIndexQueue();
   }
 
   // ---------- UI: initial screens ----------
@@ -285,15 +339,11 @@
       </div>`);
   }
 
-  function renderSelectPrompt(reconnect){
+  function renderSelectPrompt(){
     els.layout.style.display = "none";
     els.indexStatus.style.display = "none";
     setStatus("");
-    if (!reconnect){
-      renderPrivacyModal(renderFolderPicker);
-      return;
-    }
-    renderFolderPicker(true);
+    renderPrivacyModal(renderFolderPicker);
   }
 
   function renderPrivacyModal(onAcknowledge){
@@ -307,38 +357,24 @@
         </div>
       </div>`);
     const ackBtn = document.getElementById("ackBtn");
-    ackBtn.addEventListener("click", () => onAcknowledge(false));
+    ackBtn.addEventListener("click", () => onAcknowledge());
     ackBtn.focus();
   }
 
-  function renderFolderPicker(reconnect){
+  function renderFolderPicker(){
     setHTML(els.introView, `
       <div class="center-panel">
-        <h2>${reconnect ? "Reconnect folder" : "Select a folder to search"}</h2>
-        <p>${reconnect
-          ? "The browser needs you to re-confirm read permission on the saved folder."
-          : "The first time you need to pick a folder manually. It's remembered after that."}</p>
+        <h2>Select a folder to search</h2>
+        <p>The first time you need to pick a folder manually. It's remembered after that. You can link more folders later from the sidebar, and search covers all of them at once.</p>
         <div class="picker-actions">
-          <button class="primary" id="pickBtn">${reconnect ? "Reconnect" : "📁 Select folder"}</button>
-          ${reconnect ? "" : `<a class="button-like" id="githubLink" href="https://github.com/wramirezrg/siganor-search" target="_blank" rel="noopener noreferrer">⭐ View on GitHub</a>`}
+          <button class="primary" id="pickBtn">📁 Select folder</button>
+          <a class="button-like" id="githubLink" href="https://github.com/wramirezrg/siganor-search" target="_blank" rel="noopener noreferrer">⭐ View on GitHub</a>
         </div>
-        <p class="fine-print">${reconnect
-          ? "Your browser asks for this every time it opens this page. That's normal, and nothing was lost; your files were never uploaded anywhere, they stay on your device. Press Enter to reconnect instantly."
-          : "🔒 Everything stays on your device. Nothing is ever uploaded, no account needed, no server involved."}</p>
+        <p class="fine-print">🔒 Everything stays on your device. Nothing is ever uploaded, no account needed, no server involved.</p>
       </div>`);
     const pickBtn = document.getElementById("pickBtn");
-    pickBtn.onclick = reconnect ? reconnectFolder : linkFolder;
+    pickBtn.onclick = linkFolder;
     pickBtn.focus();
-  }
-
-  async function reconnectFolder(){
-    try{
-      const perm = await rootHandle.requestPermission({ mode: "read" });
-      if (perm === "granted") await scan();
-      else setStatus("Permission denied.", true);
-    }catch(e){
-      setStatus("Couldn't reconnect: " + e.message, true);
-    }
   }
 
   function setStatus(msg, isErr){
@@ -347,6 +383,17 @@
   }
 
   // ---------- Live recursive scan ----------
+  function fileKey(f){ return f.folderId + "::" + f.path; }
+
+  function updateTitle(){
+    let label;
+    if (!folders.length) label = "Search";
+    else if (folders.length === 1) label = "Search · " + folders[0].name;
+    else label = "Search · " + folders.length + " folders";
+    document.title = label;
+    els.titleText.textContent = label;
+  }
+
   async function walk(dirHandle, relPath, out){
     for await (const [name, handle] of dirHandle.entries()){
       if (name.startsWith(".")) continue; // .vscode, dotfiles
@@ -359,49 +406,80 @@
     }
   }
 
-  async function scan(){
-    scanGeneration++;
-    els.controlsRow.style.display = "none";
-    els.layout.style.display = "none";
-    setHTML(els.introView, "");
-    setHTML(els.chips, "");
-    setHTML(els.rootView, "");
-    document.title = "Search · " + rootHandle.name;
-    els.titleText.textContent = "Search · " + rootHandle.name;
-    setStatus(`Scanning ${rootHandle.name} live…`);
-    const t0 = performance.now();
+  // Scans one linked folder. Never touches allFiles/UI state — pure per-folder work so
+  // callers can merge results incrementally (link/unlink) or in a full pass (scanAllFolders).
+  async function scanFolder(rec){
+    const perm = await rec.handle.queryPermission({ mode: "read" }).catch(() => "prompt");
+    if (perm !== "granted"){
+      folderPermissionState.set(rec.id, "needs-reconnect");
+      return { ok: false };
+    }
     try{
       const files = [];
-      await walk(rootHandle, "", files);
+      await walk(rec.handle, "", files);
       files.forEach(f => {
         const segs = f.path.split("/");
         f.category = segs[0];
         f.folder = segs.slice(1, -1).join(" / ") || "(category root)";
         const dot = f.name.lastIndexOf(".");
         f.ext = dot > -1 ? f.name.slice(dot + 1).toLowerCase() : "";
+        f.folderId = rec.id;
+        f.folderName = rec.name;
       });
-      allFiles = files;
-      lastScanAt = new Date();
-      const ms = Math.round(performance.now() - t0);
-      setStatus(`${allFiles.length} files indexed in ${ms} ms.`);
-      const activeRec = folders.find(f => f.id === activeFolderId);
-      if (activeRec){
-        activeRec.lastScanAt = Date.now();
-        await idbSet(STORE_FOLDERS, activeRec.id, activeRec);
-      }
-      favoritesMap = (await idbGet(STORE_FAVORITES, activeFolderId)) || {};
-      await loadCollections();
-      await buildTextIndexMap();
-      await buildHashIndexMap();
-      buildCategoryChips();
-      els.controlsRow.style.display = "flex";
-      els.layout.style.display = "grid";
-      applyFilters();
-      await refreshInsights();
-      runIndexQueue(); // fire-and-forget: indexes new/changed PDFs in the background
+      rec.lastScanAt = Date.now();
+      await idbSet(STORE_FOLDERS, rec.id, rec);
+      folderPermissionState.set(rec.id, "granted");
+      return { ok: true, files };
     }catch(e){
-      setStatus("Error scanning the folder: " + e.message, true);
+      folderPermissionState.set(rec.id, "error");
+      return { ok: false, message: e.message };
     }
+  }
+
+  // Full pass over every linked folder — used at startup and on manual Refresh.
+  // Scans sequentially and merges results in as each folder finishes, so results stream in
+  // instead of the user waiting for the slowest folder. A folder needing reconnect is flagged
+  // (see folderPermissionState) without blocking the others.
+  async function scanAllFolders(){
+    scanGeneration++;
+    const myGeneration = scanGeneration;
+    setHTML(els.introView, "");
+    setHTML(els.chips, "");
+    setHTML(els.rootView, "");
+    updateTitle();
+    setStatus(`Scanning ${folders.length} folder(s) live…`);
+    const t0 = performance.now();
+    allFiles = [];
+    duplicateGroups = [];
+    favoritesMap = await loadFavoritesMap();
+    await loadCollections();
+    textIndex = await loadTextIndex();
+    hashIndex = await loadHashIndex();
+    els.controlsRow.style.display = "flex";
+    els.layout.style.display = "grid";
+    buildCategoryChips();
+    applyFilters();
+    await renderSidebar();
+
+    for (const rec of folders){
+      const result = await scanFolder(rec);
+      if (scanGeneration !== myGeneration) return;
+      if (result.ok){
+        allFiles = allFiles.concat(result.files);
+        buildCategoryChips();
+        applyFilters();
+        await renderSidebar();
+      }
+    }
+    if (scanGeneration !== myGeneration) return;
+
+    lastScanAt = new Date();
+    const ms = Math.round(performance.now() - t0);
+    setStatus(`${allFiles.length} files indexed in ${ms} ms.`);
+    groupDuplicates();
+    updateStatusLine();
+    await refreshInsights();
+    runIndexQueue(); // fire-and-forget: indexes new/changed PDFs in the background
   }
 
   // ---------- Categories ----------
@@ -452,7 +530,7 @@
     applyFilters();
     renderSidebar();
   });
-  els.refreshBtn.addEventListener("click", scan);
+  els.refreshBtn.addEventListener("click", scanAllFolders);
   els.exportBtn.addEventListener("click", exportResults);
   els.backupFileInput.addEventListener("change", async () => {
     const file = els.backupFileInput.files[0];
@@ -502,24 +580,28 @@
   function applyFilters(){
     const q = els.search.value.trim().toLowerCase();
     let results = allFiles;
+    if (activeFolderFilterId){
+      results = results.filter(f => f.folderId === activeFolderFilterId);
+    }
     if (activeCollectionId){
       const col = collections.find(c => c.id === activeCollectionId);
       const paths = new Set(col ? col.paths : []);
-      results = results.filter(f => paths.has(f.path));
+      const colFolderId = col ? col.folderId : null;
+      results = results.filter(f => f.folderId === colFolderId && paths.has(f.path));
     } else if (activeCategory !== ALL_VALUE){
       results = results.filter(f => f.category === activeCategory);
     }
-    if (favoritesOnly) results = results.filter(f => f.path in favoritesMap);
+    if (favoritesOnly) results = results.filter(f => fileKey(f) in favoritesMap);
 
     let snippets = null;
     if (q){
       snippets = new Map();
       results = results.filter(f => {
         if (f.name.toLowerCase().includes(q) || f.path.toLowerCase().includes(q)) return true;
-        const rec = textIndex.get(f.path);
+        const rec = textIndex.get(fileKey(f));
         if (rec && rec.text.toLowerCase().includes(q)){
           const snip = findSnippet(rec.text, q);
-          if (snip) snippets.set(f.path, snip);
+          if (snip) snippets.set(fileKey(f), snip);
           return true;
         }
         return false;
@@ -538,12 +620,13 @@
     }
     const rows = results.map((f, i) => {
       const canPreview = PREVIEWABLE.has(f.ext);
-      const isFav = f.path in favoritesMap;
-      const snippet = snippets && snippets.get(f.path);
+      const isFav = fileKey(f) in favoritesMap;
+      const snippet = snippets && snippets.get(fileKey(f));
+      const folderBadge = folders.length > 1 ? `<span class="folder-badge">📁 ${escapeHtml(f.folderName)}</span>` : "";
       return `<tr>
         <td>
           <div class="name">${escapeHtml(f.name)}</div>
-          <div class="path">${escapeHtml(f.folder)}</div>
+          <div class="path">${folderBadge}${escapeHtml(f.folder)}</div>
           ${snippet ? `<div class="snippet">📄 "${snippet}"</div>` : ""}
         </td>
         <td class="cat">${escapeHtml(f.category)}</td>
@@ -598,17 +681,17 @@
 
   // ---------- Open history ----------
   async function logOpen(entry){
-    const log = (await idbGet(STORE_OPENS, activeFolderId)) || [];
+    const log = (await idbGet(STORE_OPENS, entry.folderId)) || [];
     log.push({ path: entry.path, name: entry.name, category: entry.category, ts: Date.now() });
     const trimmed = log.slice(-MAX_OPENS);
-    await idbSet(STORE_OPENS, activeFolderId, trimmed);
+    await idbSet(STORE_OPENS, entry.folderId, trimmed);
     await renderSidebar();
   }
 
   function copyPath(entry){
     // Note: the File System Access API never exposes the real absolute system path —
-    // this is relative to the folder you selected, prefixed with that folder's own name.
-    const full = rootHandle.name + "\\" + entry.path.replace(/\//g, "\\");
+    // this is relative to the folder you linked, prefixed with that folder's own name.
+    const full = entry.folderName + "\\" + entry.path.replace(/\//g, "\\");
     navigator.clipboard.writeText(full).then(
       () => toast("Path copied: " + full),
       () => toast("Couldn't copy to clipboard")
@@ -618,14 +701,17 @@
   // ---------- Export current results ----------
   function exportResults(){
     if (!lastResults.length){ toast("Nothing to export. No results shown."); return; }
-    const lines = [`# ${rootHandle.name} · ${lastResults.length} file(s)`, `Exported ${new Date().toLocaleString()}`];
+    const folderCount = new Set(lastResults.map(f => f.folderId)).size;
+    const title = folderCount > 1 ? `${folderCount} folders` : lastResults[0].folderName;
+    const lines = [`# ${title} · ${lastResults.length} file(s)`, `Exported ${new Date().toLocaleString()}`];
     let lastCat = null;
     lastResults.forEach(f => {
       if (f.category !== lastCat){
         lines.push(`\n## ${f.category}`);
         lastCat = f.category;
       }
-      lines.push(`- **${f.name}** · ${f.folder} (${f.ext || "—"})`);
+      const folderTag = folderCount > 1 ? ` · [${f.folderName}]` : "";
+      lines.push(`- **${f.name}**${folderTag} · ${f.folder} (${f.ext || "—"})`);
     });
     const blob = new Blob([lines.join("\n")], { type: "text/markdown" });
     const url = URL.createObjectURL(blob);
@@ -673,11 +759,13 @@
       await idbDelete(STORE_COLLECTIONS, col.id);
     }
     for (const col of data.collections){
-      col.folderId = activeFolderId;
+      // Only restore collections whose folder is still linked here — a collection from a
+      // backup taken on a different set of linked folders has nowhere valid to attach.
+      if (!col.folderId || !folders.some(f => f.id === col.folderId)) continue;
       await idbSet(STORE_COLLECTIONS, col.id, col);
     }
     favoritesMap = data.favorites;
-    await idbSet(STORE_FAVORITES, activeFolderId, favoritesMap);
+    await persistAllFavorites();
 
     await loadCollections();
     buildCategoryChips();
@@ -687,13 +775,39 @@
   }
 
   // ---------- Favorites ----------
+  // In memory, favoritesMap is merged across every linked folder (key = fileKey = folderId::path)
+  // to make cross-folder search/filter simple. On disk it stays exactly as before: one record
+  // per folder, keyed by bare path — these helpers translate between the two shapes.
+  async function loadFavoritesMap(){
+    const merged = {};
+    for (const rec of folders){
+      const m = await idbGet(STORE_FAVORITES, rec.id);
+      if (m) for (const [path, ts] of Object.entries(m)) merged[rec.id + "::" + path] = ts;
+    }
+    return merged;
+  }
+
+  async function persistFavorites(folderId){
+    const prefix = folderId + "::";
+    const subset = {};
+    for (const [key, ts] of Object.entries(favoritesMap)){
+      if (key.startsWith(prefix)) subset[key.slice(prefix.length)] = ts;
+    }
+    await idbSet(STORE_FAVORITES, folderId, subset);
+  }
+
+  async function persistAllFavorites(){
+    for (const rec of folders) await persistFavorites(rec.id);
+  }
+
   async function toggleFavorite(entry, btn){
-    const isFav = entry.path in favoritesMap;
-    if (isFav) delete favoritesMap[entry.path];
-    else favoritesMap[entry.path] = Date.now();
-    await idbSet(STORE_FAVORITES, activeFolderId, favoritesMap);
+    const key = fileKey(entry);
+    const isFav = key in favoritesMap;
+    if (isFav) delete favoritesMap[key];
+    else favoritesMap[key] = Date.now();
+    await persistFavorites(entry.folderId);
     if (btn){
-      const nowFav = entry.path in favoritesMap;
+      const nowFav = key in favoritesMap;
       btn.classList.toggle("on", nowFav);
       btn.textContent = nowFav ? "★" : "☆";
       btn.title = nowFav ? "Remove from favorites" : "Add to favorites";
@@ -704,15 +818,19 @@
   }
 
   // ---------- Collections ----------
+  // Each collection stays scoped to a single folder (its own folderId field, no schema change),
+  // but the in-memory list is merged across every linked folder for sidebar display + filtering.
   async function loadCollections(){
-    collections = (await idbGetAll(STORE_COLLECTIONS)).filter(c => c.folderId === activeFolderId);
+    collections = await idbGetAll(STORE_COLLECTIONS);
     collections.sort((a, b) => a.name.localeCompare(b.name));
   }
 
-  async function createCollection(name){
+  async function createCollection(name, folderId){
     name = (name || "").trim();
     if (!name) return null;
-    const col = { id: crypto.randomUUID(), folderId: activeFolderId, name, createdAt: Date.now(), paths: [] };
+    const fid = folderId || activeFolderFilterId || (folders[0] && folders[0].id);
+    if (!fid) return null;
+    const col = { id: crypto.randomUUID(), folderId: fid, name, createdAt: Date.now(), paths: [] };
     await idbSet(STORE_COLLECTIONS, col.id, col);
     await loadCollections();
     return col;
@@ -745,8 +863,10 @@
     closeCollectionsMenu();
     const menu = document.createElement("div");
     menu.className = "collections-menu";
-    const renderMenuBody = () => `
-      ${collections.length ? collections.map(c => `
+    const renderMenuBody = () => {
+      const folderCollections = collections.filter(c => c.folderId === entry.folderId);
+      return `
+      ${folderCollections.length ? folderCollections.map(c => `
         <label class="cm-item">
           <input type="checkbox" data-colid="${escapeAttr(c.id)}" ${c.paths.includes(entry.path) ? "checked" : ""}>
           ${escapeHtml(c.name)}
@@ -754,6 +874,7 @@
       <div class="cm-new">
         <input type="text" placeholder="+ New collection" class="cm-new-input">
       </div>`;
+    };
     setHTML(menu, renderMenuBody());
 
     const rect = btn.getBoundingClientRect();
@@ -771,7 +892,7 @@
       });
       menu.querySelector(".cm-new-input").addEventListener("keydown", async (e) => {
         if (e.key === "Enter" && e.target.value.trim()){
-          const col = await createCollection(e.target.value);
+          const col = await createCollection(e.target.value, entry.folderId);
           if (col) await toggleFileInCollection(col.id, entry.path);
           await loadCollections();
           await renderSidebar();
@@ -793,9 +914,9 @@
   }
 
   // ---------- Full-text index (pdf.js for PDFs, plain read for txt/htm) ----------
-  async function buildTextIndexMap(){
-    const records = (await idbGetAll(STORE_TEXT_INDEX)).filter(r => r.folderId === activeFolderId);
-    textIndex = new Map(records.map(r => [r.path, r]));
+  async function loadTextIndex(){
+    const records = await idbGetAll(STORE_TEXT_INDEX);
+    return new Map(records.map(r => [r.folderId + "::" + r.path, r]));
   }
 
   async function extractText(entry, file){
@@ -844,7 +965,7 @@
   }
 
   async function runIndexQueue(){
-    if (indexingActive) return; // don't overlap runs (e.g. a manual refresh mid-index)
+    if (indexingActive){ indexQueuePending = true; return; } // a folder was linked/unlinked mid-run — rerun once this pass finishes
     const myGeneration = scanGeneration;
     const candidates = allFiles.filter(f => TEXT_INDEXABLE.has(f.ext));
     if (candidates.length){
@@ -855,17 +976,18 @@
       updateStatusLine();
 
       for (const entry of candidates){
-        if (scanGeneration !== myGeneration){ indexingActive = false; return; } // folder switched/unlinked mid-run — stop, don't touch the new folder's state
+        if (scanGeneration !== myGeneration){ indexingActive = false; return; } // folder set changed mid-run — stop, don't touch stale state
 
         try{
           const file = await entry.handle.getFile();
-          const cached = textIndex.get(entry.path);
+          const key = fileKey(entry);
+          const cached = textIndex.get(key);
           if (!cached || cached.size !== file.size || cached.lastModified !== file.lastModified){
             const text = await extractText(entry, file);
             if (text != null){
-              const record = { path: entry.path, folderId: activeFolderId, text, size: file.size, lastModified: file.lastModified, indexedAt: Date.now() };
-              await idbSet(STORE_TEXT_INDEX, activeFolderId + "::" + entry.path, record);
-              textIndex.set(entry.path, record);
+              const record = { path: entry.path, folderId: entry.folderId, text, size: file.size, lastModified: file.lastModified, indexedAt: Date.now() };
+              await idbSet(STORE_TEXT_INDEX, key, record);
+              textIndex.set(key, record);
               indexedCount++;
             }
           }
@@ -882,21 +1004,21 @@
       if (indexedCount > 0) applyFilters(); // newly-indexed files may now match the current search
     }
     if (scanGeneration !== myGeneration) return;
+    if (indexQueuePending){ indexQueuePending = false; return runIndexQueue(); }
     runHashQueue(); // chained, not parallel — avoids competing for I/O with the text-index pass above
   }
 
   // ---------- Duplicate detection (SHA-256, all file types) ----------
-  async function buildHashIndexMap(){
-    const records = (await idbGetAll(STORE_HASH_INDEX)).filter(r => r.folderId === activeFolderId);
-    hashIndex = new Map(records.map(r => [r.path, r]));
-    groupDuplicates();
+  async function loadHashIndex(){
+    const records = await idbGetAll(STORE_HASH_INDEX);
+    return new Map(records.map(r => [r.folderId + "::" + r.path, r]));
   }
 
   function groupDuplicates(){
-    const byPath = new Map(allFiles.map(f => [f.path, f]));
+    const byKey = new Map(allFiles.map(f => [fileKey(f), f]));
     const byHash = new Map();
-    hashIndex.forEach(rec => {
-      const f = byPath.get(rec.path);
+    hashIndex.forEach((rec, key) => {
+      const f = byKey.get(key);
       if (!f) return; // stale entry for a file that moved/disappeared — ignore, don't delete (may reappear)
       if (!byHash.has(rec.hash)) byHash.set(rec.hash, []);
       byHash.get(rec.hash).push(f);
@@ -912,7 +1034,7 @@
   }
 
   async function runHashQueue(){
-    if (hashingActive) return;
+    if (hashingActive){ hashQueuePending = true; return; }
     const myGeneration = scanGeneration;
     const candidates = allFiles;
     if (!candidates.length) return;
@@ -923,16 +1045,17 @@
     updateStatusLine();
 
     for (const entry of candidates){
-      if (scanGeneration !== myGeneration){ hashingActive = false; return; } // folder switched/unlinked mid-run
+      if (scanGeneration !== myGeneration){ hashingActive = false; return; } // folder set changed mid-run
 
       try{
         const file = await entry.handle.getFile();
-        const cached = hashIndex.get(entry.path);
+        const key = fileKey(entry);
+        const cached = hashIndex.get(key);
         if (!cached || cached.size !== file.size || cached.lastModified !== file.lastModified){
           const hash = await hashFile(file);
-          const record = { path: entry.path, folderId: activeFolderId, hash, size: file.size, lastModified: file.lastModified, hashedAt: Date.now() };
-          await idbSet(STORE_HASH_INDEX, activeFolderId + "::" + entry.path, record);
-          hashIndex.set(entry.path, record);
+          const record = { path: entry.path, folderId: entry.folderId, hash, size: file.size, lastModified: file.lastModified, hashedAt: Date.now() };
+          await idbSet(STORE_HASH_INDEX, key, record);
+          hashIndex.set(key, record);
         }
       }catch(e){
         // unreadable file — skip, not fatal to the rest of the queue
@@ -946,6 +1069,7 @@
     groupDuplicates();
     updateStatusLine();
     await renderSidebar(); // duplicates card needs to reflect the freshly computed groups
+    if (hashQueuePending){ hashQueuePending = false; runHashQueue(); }
   }
 
   function findSnippet(text, q){
@@ -986,19 +1110,27 @@
   }
 
   // ---------- "Seen" manifest -> detect newly added files ----------
+  // Stays a per-folder record on disk (as before); groups the merged file list by folder
+  // so each folder's manifest only ever reflects that folder's own current files.
   async function updateSeenManifest(currentFiles){
-    const manifest = (await idbGet(STORE_SEEN, activeFolderId)) || {};
-    const now = Date.now();
-    const currentPaths = new Set(currentFiles.map(f => f.path));
-    let changed = false;
+    const byFolder = new Map();
     currentFiles.forEach(f => {
-      if (!(f.path in manifest)){ manifest[f.path] = now; changed = true; }
+      if (!byFolder.has(f.folderId)) byFolder.set(f.folderId, []);
+      byFolder.get(f.folderId).push(f);
     });
-    Object.keys(manifest).forEach(p => {
-      if (!currentPaths.has(p)){ delete manifest[p]; changed = true; }
-    });
-    if (changed) await idbSet(STORE_SEEN, activeFolderId, manifest);
-    return manifest;
+    for (const [folderId, folderFiles] of byFolder){
+      const manifest = (await idbGet(STORE_SEEN, folderId)) || {};
+      const now = Date.now();
+      const currentPaths = new Set(folderFiles.map(f => f.path));
+      let changed = false;
+      folderFiles.forEach(f => {
+        if (!(f.path in manifest)){ manifest[f.path] = now; changed = true; }
+      });
+      Object.keys(manifest).forEach(p => {
+        if (!currentPaths.has(p)){ delete manifest[p]; changed = true; }
+      });
+      if (changed) await idbSet(STORE_SEEN, folderId, manifest);
+    }
   }
 
   // ---------- Interest profile + reading suggestions ----------
@@ -1019,8 +1151,8 @@
     return { tokenWeights, categoryWeights, topCategory };
   }
 
-  function scoreSuggestions(profile, openedPaths){
-    const candidates = allFiles.filter(f => !openedPaths.has(f.path));
+  function scoreSuggestions(profile, openedKeys){
+    const candidates = allFiles.filter(f => !openedKeys.has(fileKey(f)));
     const scored = candidates.map(f => {
       const toks = tokenize(f.path);
       let score = 0;
@@ -1074,35 +1206,43 @@
   }
 
   async function renderSidebar(){
-    const [log, manifest] = await Promise.all([
-      idbGet(STORE_OPENS, activeFolderId),
-      idbGet(STORE_SEEN, activeFolderId),
-    ]);
-    const opens = log || [];
-    const seen = manifest || {};
+    // Opens/seen stay per-folder records on disk; merge them here, tagging each entry with
+    // its own folderId so recency/favorites lists can span every linked folder without collisions.
+    let opens = [];
+    let seen = {}; // composite-keyed: fileKey -> firstSeenTs
+    for (const rec of folders){
+      const log = await idbGet(STORE_OPENS, rec.id);
+      if (log) opens = opens.concat(log.map(o => ({ ...o, folderId: rec.id })));
+      const manifest = await idbGet(STORE_SEEN, rec.id);
+      if (manifest){
+        for (const [path, ts] of Object.entries(manifest)) seen[rec.id + "::" + path] = ts;
+      }
+    }
+    opens.sort((a, b) => a.ts - b.ts);
+    const byKey = new Map(allFiles.map(f => [fileKey(f), f]));
 
     // -- Recently opened --
-    const seenPaths = new Set();
+    const seenKeys = new Set();
     const recentOpens = [];
     for (let i = opens.length - 1; i >= 0 && recentOpens.length < 10; i--){
       const o = opens[i];
-      if (seenPaths.has(o.path)) continue;
-      seenPaths.add(o.path);
-      recentOpens.push(o);
+      const k = o.folderId + "::" + o.path;
+      if (seenKeys.has(k)) continue;
+      seenKeys.add(k);
+      recentOpens.push({ ...o, key: k });
     }
     const openedHtml = recentOpens.length ? recentOpens.map(o => `
-      <button class="side-item" data-openpath="${escapeAttr(o.path)}">
+      <button class="side-item" data-filekey="${escapeAttr(o.key)}">
         <span class="si-name">${escapeHtml(o.name)}</span>
         <span class="si-meta">${escapeHtml(o.category)} · ${relativeTime(o.ts)}</span>
       </button>`).join("") : `<p class="side-hint">You haven't opened anything from here yet. Use "View" on a result and it'll show up here.</p>`;
 
     // -- Recently added --
     const addedEntries = Object.entries(seen).sort((a, b) => b[1] - a[1]).slice(0, 10);
-    const byPath = new Map(allFiles.map(f => [f.path, f]));
-    const addedHtml = addedEntries.length ? addedEntries.map(([path, ts]) => {
-      const f = byPath.get(path);
+    const addedHtml = addedEntries.length ? addedEntries.map(([key, ts]) => {
+      const f = byKey.get(key);
       if (!f) return "";
-      return `<button class="side-item" data-openpath="${escapeAttr(path)}">
+      return `<button class="side-item" data-filekey="${escapeAttr(key)}">
         <span class="si-name">${escapeHtml(f.name)}</span>
         <span class="si-meta">${escapeHtml(f.category)} · ${relativeTime(ts)}</span>
       </button>`;
@@ -1114,10 +1254,10 @@
       suggestHtml = `<p class="side-hint">Open a few documents first: I need to see what you read before I can suggest related ones.</p>`;
     } else {
       const profile = computeProfile(opens);
-      const openedPaths = new Set(opens.map(o => o.path));
-      const suggestions = scoreSuggestions(profile, openedPaths);
+      const openedKeys = new Set(opens.map(o => o.folderId + "::" + o.path));
+      const suggestions = scoreSuggestions(profile, openedKeys);
       suggestHtml = suggestions.length ? suggestions.map(s => `
-        <button class="side-item" data-openpath="${escapeAttr(s.file.path)}">
+        <button class="side-item" data-filekey="${escapeAttr(fileKey(s.file))}">
           <span class="si-name">${escapeHtml(s.file.name)}</span>
           <span class="si-meta">${escapeHtml(s.file.category)}</span>
           ${s.why.length ? `<span class="si-why">Based on your interest in: ${s.why.map(escapeHtml).join(", ")}</span>` : ""}
@@ -1127,34 +1267,44 @@
 
     // -- Favorites --
     const favEntries = Object.entries(favoritesMap).sort((a, b) => b[1] - a[1]).slice(0, 10);
-    const favHtml = favEntries.length ? favEntries.map(([path, ts]) => {
-      const f = byPath.get(path);
+    const favHtml = favEntries.length ? favEntries.map(([key, ts]) => {
+      const f = byKey.get(key);
       if (!f) return "";
-      return `<button class="side-item" data-openpath="${escapeAttr(path)}">
+      return `<button class="side-item" data-filekey="${escapeAttr(key)}">
         <span class="si-name">★ ${escapeHtml(f.name)}</span>
         <span class="si-meta">${escapeHtml(f.category)} · ${relativeTime(ts)}</span>
       </button>`;
     }).join("") : `<p class="side-hint">No favorites yet. Click the ☆ next to any file to save it here.</p>`;
 
     // -- Folders --
-    const foldersHtml = folders.length ? folders.map(f => `
-      <div class="side-item folder-item ${f.id === activeFolderId ? "active" : ""}" data-folderid="${escapeAttr(f.id)}">
-        <button class="folder-open" data-folderid="${escapeAttr(f.id)}" title="${f.id === activeFolderId ? "Active folder" : "Switch to this folder"}">
-          <span class="si-name">${f.id === activeFolderId ? "📌" : "📁"} ${escapeHtml(f.name)}</span>
+    const foldersHtml = folders.length ? folders.map(f => {
+      const permState = folderPermissionState.get(f.id);
+      const needsReconnect = permState === "needs-reconnect" || permState === "error";
+      const isFiltered = f.id === activeFolderFilterId;
+      return `
+      <div class="side-item folder-item ${isFiltered ? "active" : ""}" data-folderid="${escapeAttr(f.id)}">
+        <button class="folder-open" data-folderid="${escapeAttr(f.id)}" title="${isFiltered ? "Showing only this folder — click to show all" : "Filter results to this folder"}">
+          <span class="si-name">${isFiltered ? "📌" : "📁"} ${escapeHtml(f.name)}${needsReconnect ? ` <span class="folder-reconnect-badge">Needs reconnect</span>` : ""}</span>
           <span class="si-meta">${f.lastScanAt ? "Last scan " + relativeTime(f.lastScanAt) : "Never scanned"}</span>
         </button>
+        ${needsReconnect ? `<button class="folder-reconnect" data-folderid="${escapeAttr(f.id)}" title="Reconnect this folder">🔄</button>` : ""}
         <button class="folder-del" data-folderid="${escapeAttr(f.id)}" title="Unlink folder">✕</button>
-      </div>`).join("") : `<p class="side-hint">No folders linked yet.</p>`;
+      </div>`;
+    }).join("") : `<p class="side-hint">No folders linked yet.</p>`;
 
     // -- Collections --
-    const colHtml = collections.length ? collections.map(c => `
+    const colHtml = collections.length ? collections.map(c => {
+      const folderRec = folders.find(f => f.id === c.folderId);
+      const folderTag = folders.length > 1 && folderRec ? ` <span class="col-folder-tag">(${escapeHtml(folderRec.name)})</span>` : "";
+      return `
       <div class="side-item col-item ${c.id === activeCollectionId ? "active" : ""}" data-colid="${escapeAttr(c.id)}">
         <button class="col-open" data-colid="${escapeAttr(c.id)}">
-          <span class="si-name">🗂 ${escapeHtml(c.name)}</span>
+          <span class="si-name">🗂 ${escapeHtml(c.name)}${folderTag}</span>
           <span class="si-meta">${c.paths.length} file(s)</span>
         </button>
         <button class="col-del" data-colid="${escapeAttr(c.id)}" title="Delete collection">✕</button>
-      </div>`).join("") : `<p class="side-hint">No collections yet. Use the ＋ button next to a file to start one.</p>`;
+      </div>`;
+    }).join("") : `<p class="side-hint">No collections yet. Use the ＋ button next to a file to start one.</p>`;
 
     // -- Possible duplicates --
     const dupHtml = duplicateGroups.length ? duplicateGroups.map((group, gi) => `
@@ -1212,9 +1362,9 @@
         if (f) copyPath(f);
       });
     });
-    els.sidebar.querySelectorAll("button[data-openpath]").forEach(btn => {
+    els.sidebar.querySelectorAll("button[data-filekey]").forEach(btn => {
       btn.addEventListener("click", () => {
-        const f = byPath.get(btn.dataset.openpath);
+        const f = byKey.get(btn.dataset.filekey);
         if (f) viewFile(f); else toast("That file isn't available anymore (moved or deleted?).");
       });
     });
@@ -1248,8 +1398,16 @@
       });
     }
     els.sidebar.querySelectorAll(".folder-open").forEach(btn => {
-      btn.addEventListener("click", async () => {
-        if (btn.dataset.folderid !== activeFolderId) await setActiveFolder(btn.dataset.folderid);
+      btn.addEventListener("click", () => {
+        activeFolderFilterId = activeFolderFilterId === btn.dataset.folderid ? null : btn.dataset.folderid;
+        applyFilters();
+        renderSidebar();
+      });
+    });
+    els.sidebar.querySelectorAll(".folder-reconnect").forEach(btn => {
+      btn.addEventListener("click", async (e) => {
+        e.stopPropagation();
+        await reconnectFolder(btn.dataset.folderid);
       });
     });
     els.sidebar.querySelectorAll(".folder-del").forEach(btn => {
@@ -1273,17 +1431,14 @@
     }
     await migrateLegacyDataIfNeeded();
     await loadFolders();
-    const savedActiveId = await idbGet(STORE_HANDLES, ACTIVE_KEY).catch(() => null);
-    const rec = folders.find(f => f.id === savedActiveId) || folders[0];
-    if (rec){
-      rootHandle = rec.handle;
-      activeFolderId = rec.id;
-      const perm = await rec.handle.queryPermission({ mode: "read" }).catch(() => "prompt");
-      if (perm === "granted") await scan();
-      else renderSelectPrompt(true);
-    } else {
-      renderSelectPrompt(false);
+    if (!folders.length){
+      renderSelectPrompt();
+      return;
     }
+    // Each folder's permission is checked individually inside scanAllFolders → scanFolder;
+    // folders that still have access show results immediately, others get a "Needs reconnect"
+    // badge in the sidebar without blocking the rest.
+    await scanAllFolders();
   }
 
   init();

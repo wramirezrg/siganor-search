@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <title>Local Document Search</title>
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self'; connect-src 'self'; worker-src 'self'; object-src 'none'; base-uri 'none'; form-action 'self'; require-trusted-types-for 'script'; trusted-types docsearch-html default">
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' https://static.cloudflareinsights.com; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self'; connect-src 'self' https://cloudflareinsights.com; worker-src 'self'; object-src 'none'; base-uri 'none'; form-action 'self'; require-trusted-types-for 'script'; trusted-types docsearch-html default">
 <link rel="icon" type="image/png" href="img/siganor-icon.png">
 <style>
   :root{
@@ -189,10 +189,20 @@
     flex:1; text-align:left; background:none; border:none; padding:7px 6px; cursor:pointer;
     color:var(--text); font-size:12.5px; border-radius:8px;
   }
-  .col-del, .folder-del{
+  .col-del, .folder-del, .folder-reconnect{
     background:none; border:none; color:var(--muted); padding:4px 8px; font-size:12px; cursor:pointer; border-radius:6px;
   }
   .col-del:hover, .folder-del:hover{ color:var(--danger); }
+  .folder-reconnect:hover{ color:var(--accent); }
+  .folder-reconnect-badge{
+    display:inline-block; padding:1px 6px; border-radius:999px; font-size:10px; font-weight:700;
+    background:var(--danger); color:#fff; text-transform:uppercase; vertical-align:1px;
+  }
+  .col-folder-tag{ color:var(--muted); font-weight:400; }
+  .folder-badge{
+    display:inline-block; padding:1px 7px; border-radius:999px; font-size:10.5px; font-weight:600;
+    background:var(--chip-bg); color:var(--muted); margin-right:6px;
+  }
   tbody tr.row-selected td{ background:var(--row-hover); box-shadow:inset 2px 0 0 var(--accent); }
   .summary-total{ font-weight:700; font-size:13px; margin-bottom:8px; }
   .summary-breakdown{ display:flex; flex-direction:column; gap:3px; }
