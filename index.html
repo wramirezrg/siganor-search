@@ -109,6 +109,28 @@
   .cat{color:var(--muted); font-size:12.5px;}
   .actions{display:flex; gap:6px; white-space:nowrap;}
   .actions button{padding:6px 10px; font-size:12.5px; border-radius:8px;}
+  .tree-view{
+    background:var(--panel); border:1px solid var(--border); border-radius:12px; padding:6px; overflow:hidden;
+  }
+  .tree-folder-toggle{
+    width:100%; display:flex; align-items:center; gap:6px; text-align:left; background:none; border:none;
+    padding:8px 10px; padding-left:calc(10px + var(--depth, 0) * 18px); cursor:pointer; color:var(--text);
+    font-size:13.5px; border-radius:8px;
+  }
+  .tree-folder-toggle:hover{background:var(--row-hover);}
+  .tree-chev{color:var(--muted); font-size:11px; transition:transform .15s; display:inline-block;}
+  .tree-folder.collapsed > .tree-folder-toggle .tree-chev{transform:rotate(-90deg);}
+  .tree-folder-name{font-weight:600;}
+  .tree-folder-count{color:var(--muted); font-size:11.5px; margin-left:auto;}
+  .tree-folder.collapsed > .tree-folder-body{display:none;}
+  .tree-file-row{
+    display:flex; align-items:center; gap:10px; padding:7px 10px; padding-left:calc(10px + var(--depth, 0) * 18px);
+    border-top:1px solid var(--border); font-size:13.5px;
+  }
+  .tree-file-row:hover{background:var(--row-hover);}
+  .tree-file-name{flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;}
+  .tree-file-actions{display:flex; gap:4px; white-space:nowrap;}
+  .tree-file-actions button{padding:4px 8px; font-size:12px; border-radius:7px;}
   .chips{display:flex; gap:8px; flex-wrap:wrap; margin:12px 0 0;}
   .chip{
     padding:6px 12px; border-radius:999px; background:var(--chip-bg); color:var(--muted);

@@ -593,22 +593,38 @@
     }
     if (favoritesOnly) results = results.filter(f => fileKey(f) in favoritesMap);
 
-    let snippets = null;
-    if (q){
-      snippets = new Map();
-      results = results.filter(f => {
-        if (f.name.toLowerCase().includes(q) || f.path.toLowerCase().includes(q)) return true;
-        const rec = textIndex.get(fileKey(f));
-        if (rec && rec.text.toLowerCase().includes(q)){
-          const snip = findSnippet(rec.text, q);
-          if (snip) snippets.set(fileKey(f), snip);
-          return true;
-        }
-        return false;
-      });
+    // Browsing (no search text) shows the original folder structure as a tree.
+    // Typing a query switches to the flat, ranked results list below.
+    if (!q){
+      renderTree(results);
+      return;
     }
+
+    const snippets = new Map();
+    results = results.filter(f => {
+      if (f.name.toLowerCase().includes(q) || f.path.toLowerCase().includes(q)) return true;
+      const rec = textIndex.get(fileKey(f));
+      if (rec && rec.text.toLowerCase().includes(q)){
+        const snip = findSnippet(rec.text, q);
+        if (snip) snippets.set(fileKey(f), snip);
+        return true;
+      }
+      return false;
+    });
     results = results.slice().sort((a, b) => a.path.localeCompare(b.path));
     render(results, snippets);
+  }
+
+  function wireResultActions(container, resultsArray){
+    container.querySelectorAll("button[data-act]").forEach(btn => {
+      btn.addEventListener("click", () => {
+        const entry = resultsArray[Number(btn.dataset.idx)];
+        if (btn.dataset.act === "view") viewFile(entry);
+        else if (btn.dataset.act === "copy") copyPath(entry);
+        else if (btn.dataset.act === "fav") toggleFavorite(entry, btn);
+        else if (btn.dataset.act === "col") openCollectionsMenu(entry, btn);
+      });
+    });
   }
 
   function render(results, snippets){
@@ -650,13 +666,106 @@
         <span>Last scan: ${lastScanAt ? lastScanAt.toLocaleTimeString() : "—"}</span>
       </footer>`);
 
-    els.rootView.querySelectorAll("button[data-act]").forEach(btn => {
+    wireResultActions(els.rootView, results);
+  }
+
+  // ---------- Browse view: original folder structure, collapsible ----------
+  let collapsedTreeNodes = new Set(); // tree node keys the user has manually collapsed
+
+  function countTreeFiles(node){
+    let count = node.files.length;
+    node.children.forEach(child => { count += countTreeFiles(child); });
+    return count;
+  }
+
+  function treeFileRowHtml(f, idx, depth){
+    const canPreview = PREVIEWABLE.has(f.ext);
+    const isFav = fileKey(f) in favoritesMap;
+    return `<div class="tree-file-row" style="--depth:${depth}">
+      <span class="tree-file-name">${escapeHtml(f.name)}</span>
+      <span class="badge ${escapeAttr(f.ext)}">${escapeHtml(f.ext || "—")}</span>
+      <span class="tree-file-actions">
+        <button data-act="view" data-idx="${idx}" title="${canPreview ? "View" : "Open"}">${canPreview ? "👁" : "⬇"}</button>
+        <button data-act="copy" data-idx="${idx}" title="Copy path">📋</button>
+        <button data-act="fav" data-idx="${idx}" class="star-btn ${isFav ? "on" : ""}" title="${isFav ? "Remove from favorites" : "Add to favorites"}">${isFav ? "★" : "☆"}</button>
+        <button data-act="col" data-idx="${idx}" title="Add to a collection">＋</button>
+      </span>
+    </div>`;
+  }
+
+  function renderTreeBranch(node, key, label, depth, order, htmlParts){
+    const childNames = Array.from(node.children.keys()).sort((a, b) => a.localeCompare(b));
+    const files = node.files.slice().sort((a, b) => a.name.localeCompare(b.name));
+    const nextDepth = label !== null ? depth + 1 : depth;
+    if (label !== null){
+      const collapsed = collapsedTreeNodes.has(key);
+      htmlParts.push(`<div class="tree-folder ${collapsed ? "collapsed" : ""}" data-treekey="${escapeAttr(key)}">`);
+      htmlParts.push(`<button class="tree-folder-toggle" data-treekey="${escapeAttr(key)}" style="--depth:${depth}">
+        <span class="tree-chev">▾</span> 📁 <span class="tree-folder-name">${escapeHtml(label)}</span>
+        <span class="tree-folder-count">${countTreeFiles(node)}</span>
+      </button>`);
+      htmlParts.push(`<div class="tree-folder-body">`);
+    }
+    for (const name of childNames){
+      renderTreeBranch(node.children.get(name), key + "/" + name, name, nextDepth, order, htmlParts);
+    }
+    files.forEach(f => {
+      const idx = order.length;
+      order.push(f);
+      htmlParts.push(treeFileRowHtml(f, idx, nextDepth));
+    });
+    if (label !== null) htmlParts.push(`</div></div>`);
+  }
+
+  function renderTree(results){
+    lastResults = [];
+    selectedRowIndex = -1;
+    if (!results.length){
+      setHTML(els.rootView, `<div class="empty">No results.</div>`);
+      return;
+    }
+
+    // Group into the original folder structure: one root per linked folder, then its
+    // real subfolder chain (from each file's path), so browsing mirrors the disk layout.
+    const byFolder = new Map(); // folderId -> { name, root: {children:Map, files:[]} }
+    results.forEach(f => {
+      if (!byFolder.has(f.folderId)){
+        byFolder.set(f.folderId, { name: f.folderName, root: { children: new Map(), files: [] } });
+      }
+      const node0 = byFolder.get(f.folderId).root;
+      const segs = f.path.split("/");
+      let node = node0;
+      for (let i = 0; i < segs.length - 1; i++){
+        const seg = segs[i];
+        if (!node.children.has(seg)) node.children.set(seg, { children: new Map(), files: [] });
+        node = node.children.get(seg);
+      }
+      node.files.push(f);
+    });
+
+    const showFolderHeader = byFolder.size > 1;
+    const order = [];
+    const htmlParts = [];
+    Array.from(byFolder.entries())
+      .sort((a, b) => a[1].name.localeCompare(b[1].name))
+      .forEach(([folderId, entry]) => {
+        renderTreeBranch(entry.root, "root::" + folderId, showFolderHeader ? entry.name : null, 0, order, htmlParts);
+      });
+
+    lastResults = order;
+    setHTML(els.rootView, `
+      <div class="tree-view">${htmlParts.join("")}</div>
+      <footer>
+        <span>${order.length} file(s)</span>
+        <span>Last scan: ${lastScanAt ? lastScanAt.toLocaleTimeString() : "—"}</span>
+      </footer>`);
+
+    wireResultActions(els.rootView, order);
+    els.rootView.querySelectorAll(".tree-folder-toggle").forEach(btn => {
       btn.addEventListener("click", () => {
-        const entry = results[Number(btn.dataset.idx)];
-        if (btn.dataset.act === "view") viewFile(entry);
-        else if (btn.dataset.act === "copy") copyPath(entry);
-        else if (btn.dataset.act === "fav") toggleFavorite(entry, btn);
-        else if (btn.dataset.act === "col") openCollectionsMenu(entry, btn);
+        const key = btn.dataset.treekey;
+        if (collapsedTreeNodes.has(key)) collapsedTreeNodes.delete(key); else collapsedTreeNodes.add(key);
+        btn.closest(".tree-folder").classList.toggle("collapsed");
       });
     });
   }
