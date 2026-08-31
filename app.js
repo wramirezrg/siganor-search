@@ -670,7 +670,7 @@
   }
 
   // ---------- Browse view: original folder structure, collapsible ----------
-  let collapsedTreeNodes = new Set(); // tree node keys the user has manually collapsed
+  let expandedTreeNodes = new Set(); // tree node keys the user has manually expanded; collapsed by default
 
   function countTreeFiles(node){
     let count = node.files.length;
@@ -698,7 +698,7 @@
     const files = node.files.slice().sort((a, b) => a.name.localeCompare(b.name));
     const nextDepth = label !== null ? depth + 1 : depth;
     if (label !== null){
-      const collapsed = collapsedTreeNodes.has(key);
+      const collapsed = !expandedTreeNodes.has(key);
       htmlParts.push(`<div class="tree-folder ${collapsed ? "collapsed" : ""}" data-treekey="${escapeAttr(key)}">`);
       htmlParts.push(`<button class="tree-folder-toggle" data-treekey="${escapeAttr(key)}" style="--depth:${depth}">
         <span class="tree-chev">▾</span> 📁 <span class="tree-folder-name">${escapeHtml(label)}</span>
@@ -764,7 +764,7 @@
     els.rootView.querySelectorAll(".tree-folder-toggle").forEach(btn => {
       btn.addEventListener("click", () => {
         const key = btn.dataset.treekey;
-        if (collapsedTreeNodes.has(key)) collapsedTreeNodes.delete(key); else collapsedTreeNodes.add(key);
+        if (expandedTreeNodes.has(key)) expandedTreeNodes.delete(key); else expandedTreeNodes.add(key);
         btn.closest(".tree-folder").classList.toggle("collapsed");
       });
     });
