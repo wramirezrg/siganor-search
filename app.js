@@ -419,7 +419,7 @@
       await walk(rec.handle, "", files);
       files.forEach(f => {
         const segs = f.path.split("/");
-        f.category = segs[0];
+        f.category = segs.length > 1 ? segs[0] : "(root)";
         f.folder = segs.slice(1, -1).join(" / ") || "(category root)";
         const dot = f.name.lastIndexOf(".");
         f.ext = dot > -1 ? f.name.slice(dot + 1).toLowerCase() : "";
