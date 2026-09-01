@@ -132,7 +132,10 @@
   .tree-file-name{flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;}
   .tree-file-actions{display:flex; gap:4px; white-space:nowrap;}
   .tree-file-actions button{padding:4px 8px; font-size:12px; border-radius:7px;}
-  .chips{display:flex; gap:8px; flex-wrap:wrap; margin:12px 0 0;}
+  .chips{
+    display:flex; gap:8px; flex-wrap:wrap; margin:12px 0 0;
+    max-height:112px; overflow-y:auto; padding-right:2px;
+  }
   .chip{
     padding:6px 12px; border-radius:999px; background:var(--chip-bg); color:var(--muted);
     font-size:12.5px; cursor:pointer; border:1px solid transparent; user-select:none;
