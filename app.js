@@ -600,16 +600,20 @@
       return;
     }
 
+    const terms = q.split(/\s+/).filter(Boolean);
     const snippets = new Map();
     results = results.filter(f => {
-      if (f.name.toLowerCase().includes(q) || f.path.toLowerCase().includes(q)) return true;
+      const name = f.name.toLowerCase();
+      const path = f.path.toLowerCase();
       const rec = textIndex.get(fileKey(f));
-      if (rec && rec.text.toLowerCase().includes(q)){
-        const snip = findSnippet(rec.text, q);
+      const text = rec ? rec.text.toLowerCase() : "";
+      const allMatch = terms.every(t => name.includes(t) || path.includes(t) || text.includes(t));
+      if (!allMatch) return false;
+      if (rec){
+        const snip = findSnippet(rec.text, terms);
         if (snip) snippets.set(fileKey(f), snip);
-        return true;
       }
-      return false;
+      return true;
     });
     results = results.slice().sort((a, b) => a.path.localeCompare(b.path));
     render(results, snippets);
@@ -1181,17 +1185,49 @@
     if (hashQueuePending){ hashQueuePending = false; runHashQueue(); }
   }
 
-  function findSnippet(text, q){
-    const idx = text.toLowerCase().indexOf(q);
-    if (idx === -1) return null;
-    const start = Math.max(0, idx - SNIPPET_RADIUS);
-    const end = Math.min(text.length, idx + q.length + SNIPPET_RADIUS);
+  function findSnippet(text, terms){
+    const lower = text.toLowerCase();
+    let firstIdx = -1;
+    for (const t of terms){
+      const i = lower.indexOf(t);
+      if (i !== -1 && (firstIdx === -1 || i < firstIdx)) firstIdx = i;
+    }
+    if (firstIdx === -1) return null;
+
+    const start = Math.max(0, firstIdx - SNIPPET_RADIUS);
+    const end = Math.min(text.length, firstIdx + SNIPPET_RADIUS);
     const prefix = start > 0 ? "…" : "";
     const suffix = end < text.length ? "…" : "";
-    const before = escapeHtml(text.slice(start, idx));
-    const match = escapeHtml(text.slice(idx, idx + q.length));
-    const after = escapeHtml(text.slice(idx + q.length, end));
-    return `${prefix}${before}<mark>${match}</mark>${after}${suffix}`.replace(/\s+/g, " ");
+    const slice = text.slice(start, end);
+    const lowerSlice = slice.toLowerCase();
+
+    const ranges = [];
+    for (const t of terms){
+      let idx = 0;
+      while (true){
+        const found = lowerSlice.indexOf(t, idx);
+        if (found === -1) break;
+        ranges.push([found, found + t.length]);
+        idx = found + t.length;
+      }
+    }
+    ranges.sort((a, b) => a[0] - b[0]);
+    const merged = [];
+    for (const r of ranges){
+      const last = merged[merged.length - 1];
+      if (last && r[0] <= last[1]) last[1] = Math.max(last[1], r[1]);
+      else merged.push(r);
+    }
+
+    let out = "";
+    let cursor = 0;
+    for (const [s, e] of merged){
+      out += escapeHtml(slice.slice(cursor, s));
+      out += `<mark>${escapeHtml(slice.slice(s, e))}</mark>`;
+      cursor = e;
+    }
+    out += escapeHtml(slice.slice(cursor));
+    return `${prefix}${out}${suffix}`.replace(/\s+/g, " ");
   }
 
   function escapeHtml(s){
