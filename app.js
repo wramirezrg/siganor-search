@@ -263,7 +263,7 @@
       } else {
         updateTitle();
         await renderSidebar();
-        toast(rec.name + " needs permission — click Reconnect in the Folders list.");
+        toast(rec.name + " needs permission. Click Reconnect in the Folders list.");
       }
     }catch(e){
       if (e.name !== "AbortError") setStatus("Couldn't open the folder: " + e.message, true);
@@ -1428,7 +1428,7 @@
       const isFiltered = f.id === activeFolderFilterId;
       return `
       <div class="side-item folder-item ${isFiltered ? "active" : ""}" data-folderid="${escapeAttr(f.id)}">
-        <button class="folder-open" data-folderid="${escapeAttr(f.id)}" title="${isFiltered ? "Showing only this folder — click to show all" : "Filter results to this folder"}">
+        <button class="folder-open" data-folderid="${escapeAttr(f.id)}" title="${isFiltered ? "Showing only this folder. Click to show all" : "Filter results to this folder"}">
           <span class="si-name">${isFiltered ? "📌" : "📁"} ${escapeHtml(f.name)}${needsReconnect ? ` <span class="folder-reconnect-badge">Needs reconnect</span>` : ""}</span>
           <span class="si-meta">${f.lastScanAt ? "Last scan " + relativeTime(f.lastScanAt) : "Never scanned"}</span>
         </button>
