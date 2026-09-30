@@ -301,6 +301,14 @@
   }
   .backup-btn:hover{ border-color:var(--accent); color:var(--accent); }
 
+  /* Notice shown above a collection's files (explains missing files / active filters) */
+  .col-notice{
+    background:var(--panel); border:1px solid var(--border); border-left:3px solid var(--accent);
+    border-radius:10px; padding:10px 12px; margin:0 0 12px; font-size:13px; line-height:1.5;
+  }
+  .col-notice-actions{ display:flex; gap:8px; margin-top:8px; flex-wrap:wrap; }
+  .col-notice-actions .backup-btn{ flex:none; padding:6px 12px; }
+
   /* Settings dialog */
   .opt{
     display:flex; gap:10px; align-items:flex-start; padding:10px 12px; margin:0 0 10px;
@@ -410,6 +418,7 @@
 <script src="js/tree.js"></script>
 <script src="js/db.js"></script>
 <script src="js/settings.js"></script>
+<script src="js/collections.js"></script>
 <script src="app.js"></script>
 </body>
 </html>

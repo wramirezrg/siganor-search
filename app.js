@@ -4,7 +4,7 @@
   // Pure logic lives in js/*.js (classic scripts loaded before this file, see index.html).
   // If only part of the site was uploaded, say so instead of failing silently.
   const DS = window.DocSearch || {};
-  if (!DS.text || !DS.ranking || !DS.backup || !DS.tree || !DS.db || !DS.settings){
+  if (!DS.text || !DS.ranking || !DS.backup || !DS.tree || !DS.db || !DS.settings || !DS.collections){
     const status = document.getElementById("status");
     if (status){
       status.textContent = "Some app files failed to load (js/*.js). Upload the whole folder and reload the page.";
@@ -15,6 +15,7 @@
   const { fold, findSnippet, escapeHtml, escapeAttr, relativeTime, tokenize } = DS.text;
   const { scoreMatch } = DS.ranking;
   const { loadSettings, saveSettings, planOpen } = DS.settings;
+  const { collectionStatus, activeFilterLabels, baseName } = DS.collections;
   const { remapBackup, BACKUP_MAX_BYTES } = DS.backup;
   const {
     KEY,
@@ -64,6 +65,7 @@
   const RENDER_STEP = 300;     // flat result list draws this many rows at a time
   let renderLimit = RENDER_STEP;
   let lastFilterSig = "";
+  let collectionView = null;   // { col, status } while a collection is open (see collectionNoticeHtml)
   const SORT_KEY = "docSearchSort";
   let sortMode = loadSortMode(); // "relevance" | "path" — order of search results (browsing tree is unaffected)
   function loadSortMode(){
@@ -619,8 +621,10 @@
     if (activeFolderFilterId){
       results = results.filter(f => f.folderId === activeFolderFilterId);
     }
+    const activeCol = activeCollectionId ? collections.find(c => c.id === activeCollectionId) : null;
+    collectionView = activeCol ? { col: activeCol, status: collectionStatus(activeCol, allFiles) } : null; // for the explanatory notice
     if (activeCollectionId){
-      const col = collections.find(c => c.id === activeCollectionId);
+      const col = activeCol;
       const paths = new Set(col ? col.paths : []);
       const colFolderId = col ? col.folderId : null;
       results = results.filter(f => f.folderId === colFolderId && paths.has(f.path));
@@ -660,6 +664,56 @@
     render(results, snippets);
   }
 
+  // Explains why an open collection shows fewer files than it holds: files that are no longer in the scanned
+  // folder (moved/renamed/deleted) and any other filter still narrowing the list. Static text + escapeHtml only.
+  function collectionNoticeHtml(shown){
+    if (!collectionView) return "";
+    const { col, status } = collectionView;
+    const reachable = folderPermissionState.get(col.folderId) === "granted"; // unreachable folder: can't tell what's missing
+    const pinned = activeFolderFilterId && activeFolderFilterId !== col.folderId ? folders.find(f => f.id === activeFolderFilterId) : null;
+    const extras = activeFilterLabels({ favoritesOnly, folderName: pinned ? pinned.name : "", query: els.search.value });
+    const missing = reachable ? status.missing : [];
+    if (shown === status.total && !missing.length && !extras.length) return "";
+
+    let html = `Showing <b>${shown}</b> of <b>${status.total}</b> file(s) in “${escapeHtml(col.name)}”.`;
+    if (!reachable){
+      html += " Its folder needs to be reconnected, so its files can't be listed yet.";
+    } else if (missing.length){
+      const names = missing.slice(0, 5).map(p => escapeHtml(baseName(p))).join(", ") + (missing.length > 5 ? `, … (+${missing.length - 5} more)` : "");
+      html += ` ${missing.length} not found in the scanned folder (moved, renamed or deleted): ${names}.`;
+    }
+    if (extras.length) html += ` Filters narrowing the list: ${extras.map(escapeHtml).join("; ")}.`;
+
+    let buttons = "";
+    if (missing.length) buttons += `<button type="button" class="backup-btn" data-notice="remove">Remove ${missing.length} missing</button>`;
+    if (extras.length) buttons += `<button type="button" class="backup-btn" data-notice="clear">Clear filters</button>`;
+    return `<div class="col-notice" role="status">${html}${buttons ? `<div class="col-notice-actions">${buttons}</div>` : ""}</div>`;
+  }
+
+  function wireCollectionNotice(){
+    els.rootView.querySelectorAll("[data-notice]").forEach(btn => {
+      btn.addEventListener("click", async () => {
+        if (btn.dataset.notice === "clear"){
+          favoritesOnly = false;
+          activeFolderFilterId = null;
+          els.search.value = "";
+          buildCategoryChips();
+          applyFilters();
+          await renderSidebar();
+        } else if (btn.dataset.notice === "remove" && collectionView){
+          const { col, status } = collectionView;
+          if (!confirm(`Remove ${status.missing.length} missing file(s) from "${col.name}"? Nothing is deleted from your disk; they are only taken off this collection.`)) return;
+          const gone = new Set(status.missing);
+          col.paths = col.paths.filter(p => !gone.has(p));
+          await idbSet(STORE_COLLECTIONS, col.id, col);
+          await loadCollections();
+          applyFilters();
+          await renderSidebar();
+        }
+      });
+    });
+  }
+
   function wireResultActions(container, resultsArray){
     container.querySelectorAll("button[data-act]").forEach(btn => {
       btn.addEventListener("click", () => {
@@ -678,7 +732,8 @@
     selectedRowIndex = -1;
     if (!results.length){
       renderedCount = 0;
-      setHTML(els.rootView, `<div class="empty">No results.</div>`);
+      setHTML(els.rootView, `${collectionNoticeHtml(0)}<div class="empty">No results.</div>`);
+      wireCollectionNotice();
       announce("No results");
       return;
     }
@@ -707,7 +762,7 @@
       </tr>`;
     }).join("");
 
-    setHTML(els.rootView, `
+    setHTML(els.rootView, `${collectionNoticeHtml(results.length)}
       <table>
         <thead><tr><th scope="col">File</th><th scope="col">Category</th><th scope="col">Type</th><th scope="col">Actions</th></tr></thead>
         <tbody>${rows}</tbody>
@@ -719,6 +774,7 @@
       </footer>`);
 
     wireResultActions(els.rootView, results);
+    wireCollectionNotice();
     const showMoreBtn = document.getElementById("showMoreBtn");
     if (showMoreBtn){
       showMoreBtn.addEventListener("click", () => {
@@ -738,7 +794,8 @@
     renderedCount = 0;
     selectedRowIndex = -1;
     if (!results.length){
-      setHTML(els.rootView, `<div class="empty">No results.</div>`);
+      setHTML(els.rootView, `${collectionNoticeHtml(0)}<div class="empty">No results.</div>`);
+      wireCollectionNotice();
       announce("No results");
       return;
     }
@@ -749,7 +806,7 @@
     lastResults = order;
     renderedCount = order.length;
     announce(`${order.length} file${order.length === 1 ? "" : "s"}`);
-    setHTML(els.rootView, `
+    setHTML(els.rootView, `${collectionNoticeHtml(order.length)}
       <div class="tree-view">${html}</div>
       <footer>
         <span>${order.length} file(s)</span>
@@ -757,6 +814,7 @@
       </footer>`);
 
     wireResultActions(els.rootView, order);
+    wireCollectionNotice();
     function wireTreeToggles(container){
       container.querySelectorAll(".tree-folder-toggle").forEach(btn => {
         btn.addEventListener("click", () => {
@@ -1564,11 +1622,13 @@
     const colHtml = collections.length ? collections.map(c => {
       const folderRec = folders.find(f => f.id === c.folderId);
       const folderTag = folders.length > 1 && folderRec ? ` <span class="col-folder-tag">(${escapeHtml(folderRec.name)})</span>` : "";
+      // Files saved in the collection that are no longer in the scan (only judged when the folder was actually scanned).
+      const colMissing = folderPermissionState.get(c.folderId) === "granted" ? collectionStatus(c, allFiles).missing.length : 0;
       return `
       <div class="side-item col-item ${c.id === activeCollectionId ? "active" : ""}" data-colid="${escapeAttr(c.id)}">
         <button class="col-open" data-colid="${escapeAttr(c.id)}" aria-pressed="${c.id === activeCollectionId}">
           <span class="si-name">🗂 ${escapeHtml(c.name)}${folderTag}</span>
-          <span class="si-meta">${c.paths.length} file(s)</span>
+          <span class="si-meta"${colMissing ? ` title="${colMissing} not found in the scanned folder (moved, renamed or deleted)"` : ""}>${colMissing ? `${c.paths.length - colMissing} of ${c.paths.length}` : c.paths.length} file(s)</span>
         </button>
         <button class="col-del" data-colid="${escapeAttr(c.id)}" aria-label="Delete collection ${escapeAttr(c.name)}" title="Delete collection">✕</button>
       </div>`;
