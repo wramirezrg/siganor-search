@@ -4,7 +4,7 @@ No build step, no dependencies. This is just static files. Any static host works
 
 ## Files needed
 
-`index.html`, `app.js`, `README.md`, `LICENSE`, `_headers` (optional, see below), plus the `img/` and `vendor/` folders with their contents.
+`index.html`, `app.js`, `README.md`, `LICENSE`, `_headers` (optional, see below), plus the `js/`, `img/` and `vendor/` folders with their contents. **`js/` is required**: `index.html` loads every file in it before `app.js`, and the app shows an error instead of starting if any is missing. The `tests/` folder is optional and isn't needed to host the site.
 
 ## GitHub Pages (from your fork/copy of this repo)
 

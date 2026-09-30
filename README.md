@@ -11,7 +11,7 @@ Most "document search" tools either need a server, an installed app, or send you
 ## Features
 
 - **Live folder scan**  always reflects what's actually on disk, no index to regenerate.
-- **Search by name, folder, or category**, with instant filtering.
+- **Search by name, folder, or category**, with instant filtering. Results are ranked by relevance (name matches first, then folder, then content), ignore accents and case, and can be sorted by path instead.
 - **Full-text search inside PDFs** (and `.txt`/`.htm`)  indexed in the background via [pdf.js](https://mozilla.github.io/pdf.js/), cached so re scans are fast, with a highlighted context snippet under matches.
 - **Favorites**  star any file, filter to just your favorites.
 - **Collections**  group files across categories, browse or delete them from the sidebar.
@@ -44,11 +44,11 @@ Each time you reopen the page, your browser will ask you to reconfirm access to 
 
 ## Running it locally / hosting it yourself
 
-No build step, no dependencies to install. `index.html` and `app.js` (keep them together) plus the `img/` and `vendor/` folders are the whole app  copy them anywhere and open `index.html`, or serve them from any static host. See [DEPLOY.md](DEPLOY.md) for step by step instructions to publish your own copy on GitHub Pages.
+No build step, no dependencies to install. `index.html`, `app.js` (keep them together) plus the `js/`, `img/` and `vendor/` folders are the whole app  copy them anywhere and open `index.html`, or serve them from any static host. See [DEPLOY.md](DEPLOY.md) for step by step instructions to publish your own copy on GitHub Pages.
 
 ## Development
 
-There is no build step. Small dependency-free regression tests cover the search helpers (accent-insensitive matching and snippets) the backup import validation, and the lazy folder tree: run `node tests/search.test.js`, `node tests/backup.test.js` and `node tests/tree.test.js`. The `tests/` folder isn't needed to host the site.
+There is no build step and no dependencies. The code is split into small classic scripts so the page still works when opened straight from disk: `app.js` holds the state, scanning and rendering, while the pure logic lives in `js/` (`text.js` accent-insensitive matching and snippets, `ranking.js` relevance scoring, `backup.js` backup import validation, `tree.js` the lazy folder tree, `db.js` IndexedDB helpers). Run all the regression tests with `node tests/run-all.js` (they also check that `index.html` loads every file in `js/` and that the app boots). The `tests/` folder isn't needed to host the site.
 
 ## License
 

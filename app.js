@@ -1,31 +1,39 @@
 (function(){
   "use strict";
 
+  // Pure logic lives in js/*.js (classic scripts loaded before this file, see index.html).
+  // If only part of the site was uploaded, say so instead of failing silently.
+  const DS = window.DocSearch || {};
+  if (!DS.text || !DS.ranking || !DS.backup || !DS.tree || !DS.db){
+    const status = document.getElementById("status");
+    if (status){
+      status.textContent = "Some app files failed to load (js/*.js). Upload the whole folder and reload the page.";
+      status.className = "err";
+    }
+    return;
+  }
+  const { fold, findSnippet, escapeHtml, escapeAttr, relativeTime, tokenize } = DS.text;
+  const { scoreMatch } = DS.ranking;
+  const { remapBackup, BACKUP_MAX_BYTES } = DS.backup;
+  const {
+    KEY,
+    STORE_HANDLES, STORE_FOLDERS, STORE_OPENS, STORE_SEEN, STORE_FAVORITES, STORE_COLLECTIONS, STORE_TEXT_INDEX, STORE_HASH_INDEX,
+    idbGet, idbSet, idbGetAll, idbDelete, idbDeleteByPrefix,
+  } = DS.db;
+
   if (window.pdfjsLib){
     pdfjsLib.GlobalWorkerOptions.workerSrc = "vendor/pdfjs/pdf.worker.min.js";
   }
 
-  const DB_NAME = "doc-search";
-  const DB_VERSION = 6;
-  const STORE_HANDLES = "handles";
-  const STORE_FOLDERS = "folders"; // one record per linked folder: { id, name, handle, addedAt, lastScanAt }
-  const STORE_OPENS = "opens";     // { key: folderId, value: [{path,name,category,ts}, ...] }
-  const STORE_SEEN = "seen";       // { key: folderId, value: { [path]: firstSeenTs } }
-  const STORE_FAVORITES = "favorites";     // { key: folderId, value: { [path]: favoritedAtTs } }
-  const STORE_COLLECTIONS = "collections"; // one record per collection: { id, folderId, name, createdAt, paths: [] }
-  const STORE_TEXT_INDEX = "textIndex";    // one record per file: { path, folderId, text, size, lastModified, indexedAt }, key = `${folderId}::${path}`
-  const STORE_HASH_INDEX = "hashIndex";    // one record per file: { path, folderId, hash, size, lastModified, hashedAt }, key = `${folderId}::${path}`
-  const KEY = "root";              // legacy single-folder handle key, only read during migration
   const ACTIVE_KEY = "activeFolderId";
   const MAX_OPENS = 300;
   const HALF_LIFE_DAYS = 14;
   const ALL_VALUE = "all";
   const TEXT_INDEXABLE = new Set(["pdf","txt","htm","html"]);
   const MAX_PDF_INDEX_SIZE = 40 * 1024 * 1024; // skip huge PDFs (likely image scans, or pathologically slow)
-  const SNIPPET_RADIUS = 80;
 
   const PREVIEWABLE = new Set(["pdf","png","jpg","jpeg","gif","webp","txt","htm","html"]);
-  const STOPWORDS = new Set(["de","la","el","los","las","en","del","para","con","por","un","una","y","the","and","of","for","en-p","en-e","pdf","doc","manual","guide","user","instructions"]);
+
 
   let folders = [];            // [{ id, name, handle, addedAt, lastScanAt }] — every linked folder, always in scope
   let folderPermissionState = new Map(); // folderId -> "granted" | "needs-reconnect" | "error"
@@ -55,6 +63,11 @@
   const RENDER_STEP = 300;     // flat result list draws this many rows at a time
   let renderLimit = RENDER_STEP;
   let lastFilterSig = "";
+  const SORT_KEY = "docSearchSort";
+  let sortMode = loadSortMode(); // "relevance" | "path" — order of search results (browsing tree is unaffected)
+  function loadSortMode(){
+    try{ return localStorage.getItem(SORT_KEY) === "path" ? "path" : "relevance"; }catch(e){ return "relevance"; }
+  }
   let foldedText = new Map();  // fileKey -> accent/case-folded copy of the indexed text (memory only, never persisted)
   let selectedRowIndex = -1;
   const COLLAPSE_KEY = "docSearchCollapsedCards";
@@ -69,6 +82,7 @@
     controlsRow: document.getElementById("controlsRow"),
     search: document.getElementById("search"),
     categorySelect: document.getElementById("categorySelect"),
+    sortSelect: document.getElementById("sortSelect"),
     refreshBtn: document.getElementById("refreshBtn"),
     exportBtn: document.getElementById("exportBtn"),
     chips: document.getElementById("chips"),
@@ -95,87 +109,10 @@
     trustedTypes.createPolicy("default", { createScriptURL: s => s, createScript: s => s });
   }
 
-  // ---------- IndexedDB (folder handle + open history + seen manifest) ----------
-  // One shared connection instead of opening a new one per operation. It's dropped if another tab
-  // upgrades the DB (versionchange) or the browser closes it, and never caches a failed open.
-  let dbPromise = null;
-  function idbOpen(){
-    if (dbPromise) return dbPromise;
-    dbPromise = new Promise((resolve, reject) => {
-      const req = indexedDB.open(DB_NAME, DB_VERSION);
-      req.onupgradeneeded = () => {
-        const db = req.result;
-        if (!db.objectStoreNames.contains(STORE_HANDLES)) db.createObjectStore(STORE_HANDLES);
-        if (!db.objectStoreNames.contains(STORE_FOLDERS)) db.createObjectStore(STORE_FOLDERS);
-        if (!db.objectStoreNames.contains(STORE_OPENS)) db.createObjectStore(STORE_OPENS);
-        if (!db.objectStoreNames.contains(STORE_SEEN)) db.createObjectStore(STORE_SEEN);
-        if (!db.objectStoreNames.contains(STORE_FAVORITES)) db.createObjectStore(STORE_FAVORITES);
-        if (!db.objectStoreNames.contains(STORE_COLLECTIONS)) db.createObjectStore(STORE_COLLECTIONS);
-        if (!db.objectStoreNames.contains(STORE_TEXT_INDEX)) db.createObjectStore(STORE_TEXT_INDEX);
-        if (!db.objectStoreNames.contains(STORE_HASH_INDEX)) db.createObjectStore(STORE_HASH_INDEX);
-      };
-      req.onsuccess = () => {
-        const db = req.result;
-        db.onversionchange = () => { db.close(); dbPromise = null; };
-        db.onclose = () => { dbPromise = null; };
-        resolve(db);
-      };
-      req.onerror = () => { dbPromise = null; reject(req.error); };
-    });
-    return dbPromise;
-  }
-  async function idbGet(store, key){
-    const db = await idbOpen();
-    return new Promise((resolve, reject) => {
-      const tx = db.transaction(store, "readonly");
-      const req = tx.objectStore(store).get(key);
-      req.onsuccess = () => resolve(req.result || null);
-      req.onerror = () => reject(req.error);
-    });
-  }
-  async function idbSet(store, key, val){
-    const db = await idbOpen();
-    return new Promise((resolve, reject) => {
-      const tx = db.transaction(store, "readwrite");
-      tx.objectStore(store).put(val, key);
-      tx.oncomplete = () => resolve();
-      tx.onerror = () => reject(tx.error);
-    });
-  }
-  async function idbGetAll(store){
-    const db = await idbOpen();
-    return new Promise((resolve, reject) => {
-      const tx = db.transaction(store, "readonly");
-      const req = tx.objectStore(store).getAll();
-      req.onsuccess = () => resolve(req.result || []);
-      req.onerror = () => reject(req.error);
-    });
-  }
-  async function idbDelete(store, key){
-    const db = await idbOpen();
-    return new Promise((resolve, reject) => {
-      const tx = db.transaction(store, "readwrite");
-      tx.objectStore(store).delete(key);
-      tx.oncomplete = () => resolve();
-      tx.onerror = () => reject(tx.error);
-    });
-  }
-
-  // Deletes every record whose (string) key starts with `prefix` — used to clear one folder's `folderId::path` entries.
-  async function idbDeleteByPrefix(store, prefix){
-    const db = await idbOpen();
-    return new Promise((resolve, reject) => {
-      const tx = db.transaction(store, "readwrite");
-      const req = tx.objectStore(store).openKeyCursor(IDBKeyRange.bound(prefix, prefix + "\uffff"));
-      req.onsuccess = () => {
-        const cursor = req.result;
-        if (!cursor) return;
-        tx.objectStore(store).delete(cursor.primaryKey);
-        cursor.continue();
-      };
-      tx.oncomplete = () => resolve();
-      tx.onerror = () => reject(tx.error);
-    });
+  // Screen-reader announcements (visually hidden live region in index.html).
+  function announce(msg){
+    const el = document.getElementById("srStatus");
+    if (el) el.textContent = msg;
   }
 
   let toastTimer = null;
@@ -388,8 +325,8 @@
   function renderPrivacyModal(onAcknowledge){
     setHTML(els.introView, `
       <div class="modal-overlay">
-        <div class="modal-box">
-          <h2>🔒 Before you start</h2>
+        <div class="modal-box" role="dialog" aria-modal="true" aria-labelledby="privacyTitle">
+          <h2 id="privacyTitle">🔒 Before you start</h2>
           <p>This tool runs 100% in your browser. Your files are never uploaded, copied, or sent anywhere. There's no account needed, and no internet connection required after this page loads.</p>
           <p>In a moment your browser will ask you to confirm access to a folder. That's a standard security prompt built into Chrome/Edge, not something this site controls. You can revoke that access anytime from your browser's site settings.</p>
           <button class="primary" id="ackBtn">I understand, continue</button>
@@ -397,6 +334,7 @@
       </div>`);
     const ackBtn = document.getElementById("ackBtn");
     ackBtn.addEventListener("click", () => onAcknowledge());
+    ackBtn.addEventListener("keydown", (e) => { if (e.key === "Tab") e.preventDefault(); }); // only control: keep focus in the dialog
     ackBtn.focus();
   }
 
@@ -531,12 +469,13 @@
     els.categorySelect.value = activeCategory;
 
     const favCount = Object.keys(favoritesMap).length;
-    const favChip = `<div class="chip fav-chip ${favoritesOnly ? "active" : ""}" id="favChip">⭐ Favorites (${favCount})</div>`;
+    const favChip = `<button type="button" class="chip fav-chip ${favoritesOnly ? "active" : ""}" id="favChip" aria-pressed="${favoritesOnly}">⭐ Favorites (${favCount})</button>`;
 
     const catChips = [ALL_VALUE, ...cats].map(c => {
       const label = c === ALL_VALUE ? "All" : c;
       const count = c === ALL_VALUE ? allFiles.length : allFiles.filter(f => f.category === c).length;
-      return `<div class="chip ${c === activeCategory && !activeCollectionId ? "active" : ""}" data-cat="${escapeAttr(c)}">${escapeHtml(label)} (${count})</div>`;
+      const on = c === activeCategory && !activeCollectionId;
+      return `<button type="button" class="chip ${on ? "active" : ""}" data-cat="${escapeAttr(c)}" aria-pressed="${on}">${escapeHtml(label)} (${count})</button>`;
     }).join("");
 
     setHTML(els.chips, favChip + catChips);
@@ -545,16 +484,26 @@
       favoritesOnly = !favoritesOnly;
       applyFilters();
       buildCategoryChips();
+      document.getElementById("favChip").focus(); // the chips were rebuilt: keep keyboard focus on the same control
     });
     els.chips.querySelectorAll(".chip[data-cat]").forEach(chip => {
       chip.addEventListener("click", () => {
         activeCategory = chip.dataset.cat;
         activeCollectionId = null;
         els.categorySelect.value = activeCategory;
-        els.chips.querySelectorAll(".chip[data-cat]").forEach(c => c.classList.toggle("active", c.dataset.cat === activeCategory));
+        syncCategoryChips();
         applyFilters();
         renderSidebar();
       });
+    });
+  }
+
+  // Mirrors the active category on the chips (visual state + aria-pressed).
+  function syncCategoryChips(){
+    document.querySelectorAll(".chip[data-cat]").forEach(c => {
+      const on = c.dataset.cat === activeCategory;
+      c.classList.toggle("active", on);
+      c.setAttribute("aria-pressed", String(on));
     });
   }
 
@@ -564,10 +513,16 @@
     clearTimeout(debounceT);
     debounceT = setTimeout(applyFilters, 100);
   });
+  els.sortSelect.value = sortMode;
+  els.sortSelect.addEventListener("change", () => {
+    sortMode = els.sortSelect.value === "path" ? "path" : "relevance";
+    try{ localStorage.setItem(SORT_KEY, sortMode); }catch(e){}
+    applyFilters();
+  });
   els.categorySelect.addEventListener("change", () => {
     activeCategory = els.categorySelect.value;
     activeCollectionId = null;
-    document.querySelectorAll(".chip[data-cat]").forEach(c => c.classList.toggle("active", c.dataset.cat === activeCategory));
+    syncCategoryChips();
     applyFilters();
     renderSidebar();
   });
@@ -582,7 +537,10 @@
   // ---------- Keyboard shortcuts ----------
   function updateRowSelection(){
     const rows = els.rootView.querySelectorAll("tbody tr");
-    rows.forEach((tr, i) => tr.classList.toggle("row-selected", i === selectedRowIndex));
+    rows.forEach((tr, i) => {
+      tr.classList.toggle("row-selected", i === selectedRowIndex);
+      if (i === selectedRowIndex) tr.setAttribute("aria-current", "true"); else tr.removeAttribute("aria-current");
+    });
     if (selectedRowIndex >= 0 && rows[selectedRowIndex]){
       rows[selectedRowIndex].scrollIntoView({ block: "nearest" });
     }
@@ -590,6 +548,7 @@
   document.addEventListener("keydown", (e) => {
     const tag = (e.target.tagName || "").toLowerCase();
     const inInput = tag === "input" || tag === "textarea" || tag === "select";
+    const onControl = tag === "button" || tag === "a"; // Enter on a focused button/link must activate THAT control
 
     if (e.key === "/" && !inInput){
       e.preventDefault();
@@ -612,7 +571,7 @@
       e.preventDefault();
       selectedRowIndex = Math.max(selectedRowIndex - 1, 0);
       updateRowSelection();
-    } else if (e.key === "Enter" && selectedRowIndex >= 0){
+    } else if (e.key === "Enter" && selectedRowIndex >= 0 && !onControl){
       e.preventDefault();
       viewFile(lastResults[selectedRowIndex]);
     }
@@ -621,7 +580,7 @@
   function applyFilters(){
     const q = fold(els.search.value.trim());
     // Reset the "Show more" window only when the filter really changes (not on favorite toggles / index refreshes).
-    const sig = [q, activeFolderFilterId, activeCollectionId, activeCategory, favoritesOnly].join("|");
+    const sig = [q, activeFolderFilterId, activeCollectionId, activeCategory, favoritesOnly, sortMode].join("|");
     if (sig !== lastFilterSig){ lastFilterSig = sig; renderLimit = RENDER_STEP; }
     let results = allFiles;
     if (activeFolderFilterId){
@@ -646,6 +605,7 @@
 
     const terms = q.split(/\s+/).filter(Boolean);
     const snippets = new Map();
+    const scores = new Map();
     results = results.filter(f => {
       if (f._nf === undefined){ f._nf = fold(f.name); f._pf = fold(f.path); } // cached per file entry
       const key = fileKey(f);
@@ -657,9 +617,13 @@
         const snip = findSnippet(rec.text, terms, hay);
         if (snip) snippets.set(key, snip);
       }
+      scores.set(key, scoreMatch(terms, f._nf, f._pf, hay, q));
       return true;
     });
-    results = results.slice().sort((a, b) => a.path.localeCompare(b.path));
+    // Relevance: best score first, ties by path. "Path" keeps the previous plain path order.
+    results = results.slice().sort(sortMode === "relevance"
+      ? (a, b) => (scores.get(fileKey(b)) - scores.get(fileKey(a))) || a.path.localeCompare(b.path)
+      : (a, b) => a.path.localeCompare(b.path));
     render(results, snippets);
   }
 
@@ -682,10 +646,12 @@
     if (!results.length){
       renderedCount = 0;
       setHTML(els.rootView, `<div class="empty">No results.</div>`);
+      announce("No results");
       return;
     }
     const shown = results.slice(0, renderLimit);
     renderedCount = shown.length;
+    announce(`${results.length} result${results.length === 1 ? "" : "s"}`);
     const rows = shown.map((f, i) => {
       const canPreview = PREVIEWABLE.has(f.ext);
       const isFav = fileKey(f) in favoritesMap;
@@ -700,17 +666,17 @@
         <td class="cat">${escapeHtml(f.category)}</td>
         <td><span class="badge ${escapeAttr(f.ext)}">${escapeHtml(f.ext || "—")}</span></td>
         <td class="actions">
-          <button data-act="view" data-idx="${i}">${canPreview ? "👁 View" : "⬇ Open"}</button>
-          <button data-act="copy" data-idx="${i}">📋 Copy path</button>
-          <button data-act="fav" data-idx="${i}" class="star-btn ${isFav ? "on" : ""}" title="${isFav ? "Remove from favorites" : "Add to favorites"}">${isFav ? "★" : "☆"}</button>
-          <button data-act="col" data-idx="${i}" title="Add to a collection">＋</button>
+          <button data-act="view" data-idx="${i}" aria-label="${canPreview ? "View" : "Open"} ${escapeAttr(f.name)}">${canPreview ? "👁 View" : "⬇ Open"}</button>
+          <button data-act="copy" data-idx="${i}" aria-label="Copy path of ${escapeAttr(f.name)}">📋 Copy path</button>
+          <button data-act="fav" data-idx="${i}" class="star-btn ${isFav ? "on" : ""}" aria-pressed="${isFav}" aria-label="Favorite: ${escapeAttr(f.name)}" title="${isFav ? "Remove from favorites" : "Add to favorites"}">${isFav ? "★" : "☆"}</button>
+          <button data-act="col" data-idx="${i}" aria-haspopup="dialog" aria-label="Add ${escapeAttr(f.name)} to a collection" title="Add to a collection">＋</button>
         </td>
       </tr>`;
     }).join("");
 
     setHTML(els.rootView, `
       <table>
-        <thead><tr><th>File</th><th>Category</th><th>Type</th><th>Actions</th></tr></thead>
+        <thead><tr><th scope="col">File</th><th scope="col">Category</th><th scope="col">Type</th><th scope="col">Actions</th></tr></thead>
         <tbody>${rows}</tbody>
       </table>
       <footer>
@@ -734,107 +700,24 @@
   // ---------- Browse view: original folder structure, collapsible ----------
   let expandedTreeNodes = new Set(); // tree node keys the user has manually expanded; collapsed by default
 
-  function countTreeFiles(node){
-    let count = node.files.length;
-    node.children.forEach(child => { count += countTreeFiles(child); });
-    return count;
-  }
-
-  function treeFileRowHtml(f, idx, depth){
-    const canPreview = PREVIEWABLE.has(f.ext);
-    const isFav = fileKey(f) in favoritesMap;
-    return `<div class="tree-file-row" style="--depth:${depth}">
-      <span class="tree-file-name">${escapeHtml(f.name)}</span>
-      <span class="badge ${escapeAttr(f.ext)}">${escapeHtml(f.ext || "—")}</span>
-      <span class="tree-file-actions">
-        <button data-act="view" data-idx="${idx}" title="${canPreview ? "View" : "Open"}">${canPreview ? "👁" : "⬇"}</button>
-        <button data-act="copy" data-idx="${idx}" title="Copy path">📋</button>
-        <button data-act="fav" data-idx="${idx}" class="star-btn ${isFav ? "on" : ""}" title="${isFav ? "Remove from favorites" : "Add to favorites"}">${isFav ? "★" : "☆"}</button>
-        <button data-act="col" data-idx="${idx}" title="Add to a collection">＋</button>
-      </span>
-    </div>`;
-  }
-
-  // Large result sets: don't put collapsed folders' files in the DOM. Their HTML (plain text) is kept in
-  // `deferred` and inserted when the folder is expanded. Below this size the tree renders exactly as before.
-  const TREE_LAZY_MIN = 2000;
-
-  // `deferred` is a Map (key -> body HTML) in lazy mode, or null. `order` is filled identically either way,
-  // so data-idx values, Export list and lastResults don't depend on what is currently in the DOM.
-  function renderTreeBranch(node, key, label, depth, order, htmlParts, deferred){
-    const childNames = Array.from(node.children.keys()).sort((a, b) => a.localeCompare(b));
-    const files = node.files.slice().sort((a, b) => a.name.localeCompare(b.name));
-    const nextDepth = label !== null ? depth + 1 : depth;
-    const collapsed = label !== null && !expandedTreeNodes.has(key);
-    const defer = !!deferred && collapsed;
-    const bodyParts = defer ? [] : htmlParts;
-    if (label !== null){
-      htmlParts.push(`<div class="tree-folder ${collapsed ? "collapsed" : ""}" data-treekey="${escapeAttr(key)}">`);
-      htmlParts.push(`<button class="tree-folder-toggle" data-treekey="${escapeAttr(key)}" style="--depth:${depth}">
-        <span class="tree-chev">▾</span> 📁 <span class="tree-folder-name">${escapeHtml(label)}</span>
-        <span class="tree-folder-count">${countTreeFiles(node)}</span>
-      </button>`);
-      htmlParts.push(defer ? `<div class="tree-folder-body"></div>` : `<div class="tree-folder-body">`);
-    }
-    for (const name of childNames){
-      renderTreeBranch(node.children.get(name), key + "/" + name, name, nextDepth, order, bodyParts, deferred);
-    }
-    files.forEach(f => {
-      const idx = order.length;
-      order.push(f);
-      bodyParts.push(treeFileRowHtml(f, idx, nextDepth));
-    });
-    if (label !== null){
-      if (defer){
-        deferred.set(key, bodyParts.join(""));
-        htmlParts.push(`</div>`);
-      } else {
-        htmlParts.push(`</div></div>`);
-      }
-    }
-  }
-
   function renderTree(results){
     lastResults = [];
     renderedCount = 0;
     selectedRowIndex = -1;
     if (!results.length){
       setHTML(els.rootView, `<div class="empty">No results.</div>`);
+      announce("No results");
       return;
     }
 
-    // Group into the original folder structure: one root per linked folder, then its
-    // real subfolder chain (from each file's path), so browsing mirrors the disk layout.
-    const byFolder = new Map(); // folderId -> { name, root: {children:Map, files:[]} }
-    results.forEach(f => {
-      if (!byFolder.has(f.folderId)){
-        byFolder.set(f.folderId, { name: f.folderName, root: { children: new Map(), files: [] } });
-      }
-      const node0 = byFolder.get(f.folderId).root;
-      const segs = f.path.split("/");
-      let node = node0;
-      for (let i = 0; i < segs.length - 1; i++){
-        const seg = segs[i];
-        if (!node.children.has(seg)) node.children.set(seg, { children: new Map(), files: [] });
-        node = node.children.get(seg);
-      }
-      node.files.push(f);
+    const { order, html, deferred } = DS.tree.buildTreeHtml(results, {
+      expanded: expandedTreeNodes, favorites: favoritesMap, previewable: PREVIEWABLE,
     });
-
-    const showFolderHeader = byFolder.size > 1;
-    const order = [];
-    const htmlParts = [];
-    const deferred = results.length > TREE_LAZY_MIN ? new Map() : null;
-    Array.from(byFolder.entries())
-      .sort((a, b) => a[1].name.localeCompare(b[1].name))
-      .forEach(([folderId, entry]) => {
-        renderTreeBranch(entry.root, "root::" + folderId, showFolderHeader ? entry.name : null, 0, order, htmlParts, deferred);
-      });
-
     lastResults = order;
     renderedCount = order.length;
+    announce(`${order.length} file${order.length === 1 ? "" : "s"}`);
     setHTML(els.rootView, `
-      <div class="tree-view">${htmlParts.join("")}</div>
+      <div class="tree-view">${html}</div>
       <footer>
         <span>${order.length} file(s)</span>
         <span>Last scan: ${lastScanAt ? lastScanAt.toLocaleTimeString() : "—"}</span>
@@ -856,6 +739,7 @@
           }
           if (expandedTreeNodes.has(key)) expandedTreeNodes.delete(key); else expandedTreeNodes.add(key);
           folderEl.classList.toggle("collapsed");
+          btn.setAttribute("aria-expanded", String(!folderEl.classList.contains("collapsed")));
         });
       });
     }
@@ -926,76 +810,6 @@
   }
 
   // ---------- Backup / restore (favorites + collections only) ----------
-  const BACKUP_MAX_BYTES = 5 * 1024 * 1024;
-  const BACKUP_MAX_FAVORITES = 50000;
-  const BACKUP_MAX_COLLECTIONS = 2000;
-
-  // Pure (no DOM/IndexedDB): validates a backup file and re-targets it at the folders linked HERE.
-  // Folder ids are per-browser UUIDs, so a backup from another browser is matched by folder name.
-  // The file is untrusted input: only known fields are copied, with their types checked.
-  //   linked        [{ id, name }]  folders currently linked
-  //   keptIds       Set of collection ids that stay in place (so imported ones must not reuse them)
-  //   newId         () => fresh id
-  function remapBackup(data, linked, keptIds, newId){
-    if (!data || typeof data !== "object" || Array.isArray(data)
-        || !data.favorites || typeof data.favorites !== "object" || Array.isArray(data.favorites)
-        || !Array.isArray(data.collections)){
-      return { ok: false, error: "That file doesn't look like a doc-search backup." };
-    }
-    if (Object.keys(data.favorites).length > BACKUP_MAX_FAVORITES || data.collections.length > BACKUP_MAX_COLLECTIONS){
-      return { ok: false, error: "That backup is too large to import." };
-    }
-    const names = (data.folders && typeof data.folders === "object" && !Array.isArray(data.folders)) ? data.folders : {};
-    const linkedIds = new Set(linked.map(f => f.id));
-    const byName = new Map(); // lowercased name -> id, or null when two linked folders share the name
-    for (const f of linked){
-      const n = String(f.name).toLowerCase();
-      byName.set(n, byName.has(n) ? null : f.id);
-    }
-    const cache = new Map();
-    const skippedFolders = new Set();
-    function resolve(oldId){
-      if (cache.has(oldId)) return cache.get(oldId);
-      let target = null;
-      if (linkedIds.has(oldId)) target = oldId;
-      else if (typeof names[oldId] === "string") target = byName.get(names[oldId].toLowerCase()) || null;
-      if (!target) skippedFolders.add(typeof names[oldId] === "string" ? names[oldId] : "(unknown folder)");
-      cache.set(oldId, target);
-      return target;
-    }
-
-    const targets = new Set();
-    for (const oldId of Object.keys(names)){ const t = resolve(oldId); if (t) targets.add(t); }
-
-    const favorites = {};       // newFolderId::path -> ts
-    let favCount = 0, skipped = 0;
-    for (const [key, ts] of Object.entries(data.favorites)){
-      const sep = key.indexOf("::");
-      const target = sep > 0 ? resolve(key.slice(0, sep)) : null;
-      const path = sep > 0 ? key.slice(sep + 2) : "";
-      if (!target || !path || typeof ts !== "number" || !Number.isFinite(ts)){ skipped++; continue; }
-      favorites[target + "::" + path] = ts;
-      targets.add(target);
-      favCount++;
-    }
-
-    const used = new Set(keptIds);
-    const cols = [];
-    for (const c of data.collections){
-      const target = (c && typeof c.folderId === "string") ? resolve(c.folderId) : null;
-      if (!target || typeof c.name !== "string" || !c.name.trim() || !Array.isArray(c.paths)){ skipped++; continue; }
-      let id = (typeof c.id === "string" && c.id && !used.has(c.id)) ? c.id : newId();
-      used.add(id);
-      cols.push({
-        id, folderId: target, name: c.name.trim().slice(0, 200),
-        createdAt: (typeof c.createdAt === "number" && Number.isFinite(c.createdAt)) ? c.createdAt : Date.now(),
-        paths: c.paths.filter(p => typeof p === "string" && p),
-      });
-      targets.add(target);
-    }
-    return { ok: true, favorites, favCount, collections: cols, targets, skipped, skippedFolders: [...skippedFolders] };
-  }
-
   function exportBackup(){
     const linkedIds = new Set(folders.map(f => f.id));
     const folderNames = {};
@@ -1104,6 +918,7 @@
     if (btn){
       const nowFav = key in favoritesMap;
       btn.classList.toggle("on", nowFav);
+      btn.setAttribute("aria-pressed", String(nowFav));
       btn.textContent = nowFav ? "★" : "☆";
       btn.title = nowFav ? "Remove from favorites" : "Add to favorites";
     }
@@ -1149,7 +964,9 @@
     await renderSidebar();
   }
 
+  let menuCleanup = null; // removes the open menu's outside-click listener
   function closeCollectionsMenu(){
+    if (menuCleanup){ menuCleanup(); menuCleanup = null; }
     const existing = document.querySelector(".collections-menu");
     if (existing) existing.remove();
   }
@@ -1158,6 +975,8 @@
     closeCollectionsMenu();
     const menu = document.createElement("div");
     menu.className = "collections-menu";
+    menu.setAttribute("role", "dialog");
+    menu.setAttribute("aria-label", "Add to collection");
     const renderMenuBody = () => {
       const folderCollections = collections.filter(c => c.folderId === entry.folderId);
       return `
@@ -1167,7 +986,7 @@
           ${escapeHtml(c.name)}
         </label>`).join("") : `<p class="side-hint">No collections yet.</p>`}
       <div class="cm-new">
-        <input type="text" placeholder="+ New collection" class="cm-new-input">
+        <input type="text" placeholder="+ New collection" aria-label="New collection name" class="cm-new-input">
       </div>`;
     };
     setHTML(menu, renderMenuBody());
@@ -1193,19 +1012,36 @@
           await renderSidebar();
           setHTML(menu, renderMenuBody());
           wireMenuInputs();
+          menu.querySelector(".cm-new-input").focus(); // the body was rebuilt: keep keyboard focus in the menu
         }
       });
     }
     wireMenuInputs();
 
-    setTimeout(() => {
-      document.addEventListener("click", function onDocClick(e){
-        if (!menu.contains(e.target) && e.target !== btn){
-          closeCollectionsMenu();
-          document.removeEventListener("click", onDocClick);
-        }
-      });
-    }, 0);
+    // Esc closes and returns focus to the "＋" button; Tab stays inside the menu.
+    menu.addEventListener("keydown", (e) => {
+      if (e.key === "Escape"){
+        e.preventDefault();
+        closeCollectionsMenu();
+        btn.focus();
+      } else if (e.key === "Tab"){
+        const items = Array.from(menu.querySelectorAll("input"));
+        if (!items.length) return;
+        const first = items[0], last = items[items.length - 1];
+        if (e.shiftKey && document.activeElement === first){ e.preventDefault(); last.focus(); }
+        else if (!e.shiftKey && document.activeElement === last){ e.preventDefault(); first.focus(); }
+      }
+    });
+    (menu.querySelector("input[type=checkbox]") || menu.querySelector(".cm-new-input")).focus();
+
+    // Outside click closes it. The listener is registered on the next tick (so the click that opened the
+    // menu doesn't close it) and removed whenever the menu closes, so an old menu can't close a newer one.
+    const onDocClick = (e) => {
+      if (!menu.contains(e.target) && e.target !== btn) closeCollectionsMenu();
+    };
+    const cleanup = () => document.removeEventListener("click", onDocClick);
+    menuCleanup = cleanup;
+    setTimeout(() => { if (menuCleanup === cleanup) document.addEventListener("click", onDocClick); }, 0);
   }
 
   // ---------- Full-text index (pdf.js for PDFs, plain read for txt/htm) ----------
@@ -1400,13 +1236,6 @@
     if (hashQueuePending){ hashQueuePending = false; runHashQueue(); }
   }
 
-  // ---------- Accent/case-insensitive matching ----------
-  // "ñ" is kept distinct from "n" (año != ano); every other accent is dropped. Length is preserved
-  // for normal (precomposed) text, which lets snippets be cut from the original with its accents.
-  function fold(s){
-    return s.toLowerCase().replace(/\u00f1|n\u0303/g, "\u0001").normalize("NFD").replace(/[\u0300-\u036f]/g, "");
-  }
-
   function getFolded(key, rec){
     let f = foldedText.get(key);
     if (f === undefined){ f = fold(rec.text); foldedText.set(key, f); }
@@ -1425,77 +1254,6 @@
         deadline = performance.now() + 8;
       }
     }
-  }
-
-  // `hay` is the folded text (see getFolded). Matching runs on it; the fragment shown to the user is cut
-  // from the original text when both have the same length (keeps accents), otherwise from `hay`.
-  function findSnippet(text, terms, hay){
-    if (hay.length !== text.length) text = hay;
-    let firstIdx = -1;
-    for (const t of terms){
-      const i = hay.indexOf(t);
-      if (i !== -1 && (firstIdx === -1 || i < firstIdx)) firstIdx = i;
-    }
-    if (firstIdx === -1) return null;
-
-    const start = Math.max(0, firstIdx - SNIPPET_RADIUS);
-    const end = Math.min(text.length, firstIdx + SNIPPET_RADIUS);
-    const prefix = start > 0 ? "…" : "";
-    const suffix = end < text.length ? "…" : "";
-    const slice = text.slice(start, end);
-    const lowerSlice = hay.slice(start, end);
-
-    const ranges = [];
-    for (const t of terms){
-      let idx = 0;
-      while (true){
-        const found = lowerSlice.indexOf(t, idx);
-        if (found === -1) break;
-        ranges.push([found, found + t.length]);
-        idx = found + t.length;
-      }
-    }
-    ranges.sort((a, b) => a[0] - b[0]);
-    const merged = [];
-    for (const r of ranges){
-      const last = merged[merged.length - 1];
-      if (last && r[0] <= last[1]) last[1] = Math.max(last[1], r[1]);
-      else merged.push(r);
-    }
-
-    let out = "";
-    let cursor = 0;
-    for (const [s, e] of merged){
-      out += escapeHtml(slice.slice(cursor, s));
-      out += `<mark>${escapeHtml(slice.slice(s, e))}</mark>`;
-      cursor = e;
-    }
-    out += escapeHtml(slice.slice(cursor));
-    return `${prefix}${out}${suffix}`.replace(/\s+/g, " ");
-  }
-
-  function escapeHtml(s){
-    return String(s).replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
-  }
-  function escapeAttr(s){ return escapeHtml(s); }
-
-  function relativeTime(ts){
-    const s = Math.round((Date.now() - ts) / 1000);
-    if (s < 60) return "just now";
-    const m = Math.round(s / 60);
-    if (m < 60) return `${m} min ago`;
-    const h = Math.round(m / 60);
-    if (h < 24) return `${h} h ago`;
-    const d = Math.round(h / 24);
-    if (d < 30) return `${d} d ago`;
-    return `${Math.round(d / 30)} month(s) ago`;
-  }
-
-  function tokenize(path){
-    return path
-      .toLowerCase()
-      .split(/[\/\-_.\s()]+/)
-      .filter(t => t.length >= 3 && !/^\d+$/.test(t) && !STOPWORDS.has(t));
   }
 
   // ---------- "Seen" manifest -> detect newly added files ----------
@@ -1571,8 +1329,22 @@
   function toggleCard(cardEl){
     const key = cardEl.dataset.card;
     const nowCollapsed = cardEl.classList.toggle("collapsed");
+    const toggle = cardEl.querySelector(".card-toggle");
+    if (toggle) toggle.setAttribute("aria-expanded", String(!nowCollapsed));
     if (nowCollapsed) collapsedCards.add(key); else collapsedCards.delete(key);
     persistCollapsedCards();
+  }
+
+  // Selector for the sidebar control that currently has focus (id, or class + data-* attributes), or "".
+  function sidebarFocusSelector(){
+    const a = document.activeElement;
+    if (!a || !els.sidebar.contains(a) || a === els.sidebar) return "";
+    if (a.id) return "#" + CSS.escape(a.id);
+    let sel = a.classList.length ? "." + CSS.escape(a.classList[0]) : a.tagName.toLowerCase();
+    for (const attr of a.attributes){
+      if (attr.name.startsWith("data-")) sel += `[${attr.name}="${CSS.escape(attr.value)}"]`;
+    }
+    return sel;
   }
 
   // ---------- Library summary (counts by type, no extra I/O — derived from allFiles) ----------
@@ -1672,12 +1444,12 @@
       const isFiltered = f.id === activeFolderFilterId;
       return `
       <div class="side-item folder-item ${isFiltered ? "active" : ""}" data-folderid="${escapeAttr(f.id)}">
-        <button class="folder-open" data-folderid="${escapeAttr(f.id)}" title="${isFiltered ? "Showing only this folder. Click to show all" : "Filter results to this folder"}">
+        <button class="folder-open" data-folderid="${escapeAttr(f.id)}" aria-pressed="${isFiltered}" title="${isFiltered ? "Showing only this folder. Click to show all" : "Filter results to this folder"}">
           <span class="si-name">${isFiltered ? "📌" : "📁"} ${escapeHtml(f.name)}${needsReconnect ? ` <span class="folder-reconnect-badge">Needs reconnect</span>` : ""}</span>
           <span class="si-meta">${f.lastScanAt ? "Last scan " + relativeTime(f.lastScanAt) : "Never scanned"}</span>
         </button>
-        ${needsReconnect ? `<button class="folder-reconnect" data-folderid="${escapeAttr(f.id)}" title="Reconnect this folder">🔄</button>` : ""}
-        <button class="folder-del" data-folderid="${escapeAttr(f.id)}" title="Unlink folder">✕</button>
+        ${needsReconnect ? `<button class="folder-reconnect" data-folderid="${escapeAttr(f.id)}" aria-label="Reconnect folder ${escapeAttr(f.name)}" title="Reconnect this folder">🔄</button>` : ""}
+        <button class="folder-del" data-folderid="${escapeAttr(f.id)}" aria-label="Unlink folder ${escapeAttr(f.name)}" title="Unlink folder">✕</button>
       </div>`;
     }).join("") : `<p class="side-hint">No folders linked yet.</p>`;
 
@@ -1687,11 +1459,11 @@
       const folderTag = folders.length > 1 && folderRec ? ` <span class="col-folder-tag">(${escapeHtml(folderRec.name)})</span>` : "";
       return `
       <div class="side-item col-item ${c.id === activeCollectionId ? "active" : ""}" data-colid="${escapeAttr(c.id)}">
-        <button class="col-open" data-colid="${escapeAttr(c.id)}">
+        <button class="col-open" data-colid="${escapeAttr(c.id)}" aria-pressed="${c.id === activeCollectionId}">
           <span class="si-name">🗂 ${escapeHtml(c.name)}${folderTag}</span>
           <span class="si-meta">${c.paths.length} file(s)</span>
         </button>
-        <button class="col-del" data-colid="${escapeAttr(c.id)}" title="Delete collection">✕</button>
+        <button class="col-del" data-colid="${escapeAttr(c.id)}" aria-label="Delete collection ${escapeAttr(c.name)}" title="Delete collection">✕</button>
       </div>`;
     }).join("") : `<p class="side-hint">No collections yet. Use the ＋ button next to a file to start one.</p>`;
 
@@ -1705,7 +1477,7 @@
               <span class="si-name">${escapeHtml(f.name)}</span>
               <span class="si-meta">${escapeHtml(f.folder)}</span>
             </button>
-            <button class="dup-copy" data-dupg="${gi}" data-dupf="${fi}" title="Copy path">📋</button>
+            <button class="dup-copy" data-dupg="${gi}" data-dupf="${fi}" aria-label="Copy path of ${escapeAttr(f.name)}" title="Copy path">📋</button>
           </div>`).join("")}
       </div>`).join("")
       : (hashingActive || !hashIndex.size
@@ -1714,16 +1486,18 @@
 
     const cardDef = (key, title, bodyHtml) =>
       `<div class="side-card ${collapsedCards.has(key) ? "collapsed" : ""}" data-card="${key}">
-        <h3>${title}<span class="chev">▾</span></h3>
+        <h3><button type="button" class="card-toggle" aria-expanded="${!collapsedCards.has(key)}">${title}<span class="chev" aria-hidden="true">▾</span></button></h3>
         ${bodyHtml}
       </div>`;
 
+    // The sidebar is rebuilt on most actions; remember which control had keyboard focus so it isn't lost.
+    const focusSel = sidebarFocusSelector();
     setHTML(els.sidebar,
       cardDef("folders", "📁 Folders", `<div class="side-list">${foldersHtml}</div><div class="cm-new"><button class="backup-btn" id="linkFolderBtn" style="width:100%;">📁 + Link new folder</button></div>`) +
       cardDef("summary", "📊 Library summary", buildSummaryHtml()) +
       cardDef("duplicates", "⚠ Possible duplicates", `<div class="side-list">${dupHtml}</div>`) +
       cardDef("favorites", "⭐ Favorites", `<div class="side-list">${favHtml}</div>`) +
-      cardDef("collections", "🗂 Collections", `<div class="side-list">${colHtml}</div><div class="cm-new"><input type="text" placeholder="+ New collection" class="cm-new-input" id="sidebarNewCollection"></div>`) +
+      cardDef("collections", "🗂 Collections", `<div class="side-list">${colHtml}</div><div class="cm-new"><input type="text" placeholder="+ New collection" aria-label="New collection name" class="cm-new-input" id="sidebarNewCollection"></div>`) +
       cardDef("opened", "🕒 Recently opened", `<div class="side-list">${openedHtml}</div>`) +
       cardDef("added", "🆕 Recently added", `<div class="side-list">${addedHtml}</div>`) +
       cardDef("suggestions", "📚 Reading suggestions", `<div class="side-list">${suggestHtml}</div>`) +
@@ -1734,9 +1508,13 @@
           <button class="backup-btn" id="importBackupBtn">⬆ Import backup</button>
         </div>`));
 
-    els.sidebar.querySelectorAll(".side-card > h3").forEach(h3 => {
-      h3.addEventListener("click", () => toggleCard(h3.closest(".side-card")));
+    els.sidebar.querySelectorAll(".card-toggle").forEach(btn => {
+      btn.addEventListener("click", () => toggleCard(btn.closest(".side-card")));
     });
+    if (focusSel){
+      const again = els.sidebar.querySelector(focusSel);
+      if (again) again.focus({ preventScroll: true });
+    }
     document.getElementById("exportBackupBtn").addEventListener("click", exportBackup);
     document.getElementById("importBackupBtn").addEventListener("click", () => els.backupFileInput.click());
     els.sidebar.querySelectorAll(".dup-open").forEach(btn => {
