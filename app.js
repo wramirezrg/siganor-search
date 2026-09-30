@@ -92,6 +92,32 @@
     titleText: document.getElementById("titleText"),
   };
 
+  // ---------- Stable header height (avoids layout shift while the UI loads) ----------
+  // For a returning user the header grows several times during startup (controls row, then the category chips,
+  // which wrap onto more rows as folders are scanned), pushing the whole page down each time. The height from
+  // the last finished load is remembered (per window width) and reserved from the first paint.
+  const HEADER_H_KEY = "docSearchHeaderH";
+  const headerEl = document.querySelector("header");
+  function reserveHeaderHeight(){
+    try{
+      const [h, w] = String(localStorage.getItem(HEADER_H_KEY) || "").split("@").map(Number);
+      if (headerEl && h >= 40 && h <= 600 && Math.abs(w - window.innerWidth) < 60) headerEl.style.minHeight = h + "px";
+    }catch(e){}
+  }
+  function rememberHeaderHeight(){
+    if (!headerEl || !folders.length) return;
+    headerEl.style.minHeight = "";                 // measure the natural height...
+    const h = headerEl.offsetHeight;
+    headerEl.style.minHeight = h + "px";           // ...then hold it
+    try{ localStorage.setItem(HEADER_H_KEY, h + "@" + window.innerWidth); }catch(e){}
+  }
+  function forgetHeaderHeight(){
+    if (headerEl) headerEl.style.minHeight = "";
+    try{ localStorage.removeItem(HEADER_H_KEY); }catch(e){}
+  }
+  reserveHeaderHeight(); // synchronous, before any IndexedDB work
+  window.addEventListener("resize", () => { if (headerEl) headerEl.style.minHeight = ""; }); // height depends on width
+
   // ---------- Trusted Types gate ----------
   // Every dynamic HTML string assigned below is already escaped via escapeHtml()/escapeAttr(),
   // so this policy doesn't re-sanitize — it's a gate: only code that calls setHTML() may write
@@ -229,6 +255,7 @@
         groupDuplicates();
         updateTitle();
         buildCategoryChips();
+        rememberHeaderHeight();
         applyFilters();
         await refreshInsights();
         runIndexQueue();
@@ -254,6 +281,7 @@
         groupDuplicates();
         updateTitle();
         buildCategoryChips();
+        rememberHeaderHeight();
         applyFilters();
         await refreshInsights();
         runIndexQueue();
@@ -292,11 +320,13 @@
       els.indexStatus.style.display = "none";
       els.controlsRow.style.display = "none";
       setHTML(els.chips, "");
+      forgetHeaderHeight();
       renderSelectPrompt();
       return;
     }
 
     buildCategoryChips();
+    rememberHeaderHeight();
     applyFilters();
     await refreshInsights();
     runIndexQueue();
@@ -457,6 +487,7 @@
     setStatus(`${allFiles.length} files indexed in ${ms} ms.`);
     groupDuplicates();
     updateStatusLine();
+    rememberHeaderHeight(); // chips are final now: hold this height for the next load
     await refreshInsights();
     runIndexQueue(); // fire-and-forget: indexes new/changed PDFs in the background
   }
@@ -1486,7 +1517,7 @@
 
     const cardDef = (key, title, bodyHtml) =>
       `<div class="side-card ${collapsedCards.has(key) ? "collapsed" : ""}" data-card="${key}">
-        <h3><button type="button" class="card-toggle" aria-expanded="${!collapsedCards.has(key)}">${title}<span class="chev" aria-hidden="true">▾</span></button></h3>
+        <h2><button type="button" class="card-toggle" aria-expanded="${!collapsedCards.has(key)}">${title}<span class="chev" aria-hidden="true">▾</span></button></h2>
         ${bodyHtml}
       </div>`;
 
