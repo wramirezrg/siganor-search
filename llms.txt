@@ -1,0 +1,14 @@
+# Local Document Search
+
+> A zero-backend document search tool that runs entirely in the browser. Point it at a local folder to get full-text search (including inside PDFs), favorites, collections and duplicate detection. Files are read from disk by the browser and never uploaded.
+
+It needs a Chromium-based browser (Microsoft Edge or Google Chrome) because it uses the File System Access API, so it is an interactive tool rather than a content site.
+
+## Docs
+
+- [README](https://github.com/wramirezrg/siganor-search/blob/main/README.md): features, privacy and usage
+- [Deployment guide](https://github.com/wramirezrg/siganor-search/blob/main/DEPLOY.md): how to host your own copy
+
+## Optional
+
+- [Siganor](https://www.siganor.com): the author's site
