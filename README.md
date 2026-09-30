@@ -24,7 +24,9 @@ Most "document search" tools either need a server, an installed app, or send you
 
 ## Privacy
 
-Everything runs client side. Your files are read directly from disk by your browser and never leave your machine  there is no server component, no analytics, no network calls other than loading this page itself. Search history, favorites, and collections are stored in your browser's IndexedDB, scoped to your browser profile only.
+Everything runs client side. Your files are read directly from disk by your browser and never leave your machine: file contents, file names, and folder names are never uploaded, and there is no server component that receives them. Search history, favorites, and collections are stored in your browser's IndexedDB, scoped to your browser profile only.
+
+The publicly hosted version uses [Cloudflare Web Analytics](https://www.cloudflare.com/web-analytics/) to count page visits (cookieless, no personal profiles). That measurement only sees that the page was loaded; it never has access to your files or folders. A copy you host yourself doesn't include it unless you add it.
 
 ## Requirements
 
@@ -43,6 +45,10 @@ Each time you reopen the page, your browser will ask you to reconfirm access to 
 ## Running it locally / hosting it yourself
 
 No build step, no dependencies to install. `index.html` and `app.js` (keep them together) plus the `img/` and `vendor/` folders are the whole app  copy them anywhere and open `index.html`, or serve them from any static host. See [DEPLOY.md](DEPLOY.md) for step by step instructions to publish your own copy on GitHub Pages.
+
+## Development
+
+There is no build step. Small dependency-free regression tests cover the search helpers (accent-insensitive matching and snippets) the backup import validation, and the lazy folder tree: run `node tests/search.test.js`, `node tests/backup.test.js` and `node tests/tree.test.js`. The `tests/` folder isn't needed to host the site.
 
 ## License
 

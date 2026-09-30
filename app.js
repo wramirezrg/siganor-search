@@ -50,6 +50,12 @@
   let duplicateGroups = [];    // [[entry, entry, ...], ...] — groups of 2+ files sharing a hash
   let scanGeneration = 0;      // bumped when the linked-folder set changes; lets stale index/hash loops detect they're obsolete and stop
   let lastResults = [];        // last rendered/filtered results, for keyboard nav + export
+  let lastSnippets = null;     // snippets for lastResults, so "Show more" can repaint
+  let renderedCount = 0;       // rows actually drawn in the flat list (lastResults may be longer)
+  const RENDER_STEP = 300;     // flat result list draws this many rows at a time
+  let renderLimit = RENDER_STEP;
+  let lastFilterSig = "";
+  let foldedText = new Map();  // fileKey -> accent/case-folded copy of the indexed text (memory only, never persisted)
   let selectedRowIndex = -1;
   const COLLAPSE_KEY = "docSearchCollapsedCards";
   let collapsedCards = loadCollapsedCards();
@@ -90,8 +96,12 @@
   }
 
   // ---------- IndexedDB (folder handle + open history + seen manifest) ----------
+  // One shared connection instead of opening a new one per operation. It's dropped if another tab
+  // upgrades the DB (versionchange) or the browser closes it, and never caches a failed open.
+  let dbPromise = null;
   function idbOpen(){
-    return new Promise((resolve, reject) => {
+    if (dbPromise) return dbPromise;
+    dbPromise = new Promise((resolve, reject) => {
       const req = indexedDB.open(DB_NAME, DB_VERSION);
       req.onupgradeneeded = () => {
         const db = req.result;
@@ -104,9 +114,15 @@
         if (!db.objectStoreNames.contains(STORE_TEXT_INDEX)) db.createObjectStore(STORE_TEXT_INDEX);
         if (!db.objectStoreNames.contains(STORE_HASH_INDEX)) db.createObjectStore(STORE_HASH_INDEX);
       };
-      req.onsuccess = () => resolve(req.result);
-      req.onerror = () => reject(req.error);
+      req.onsuccess = () => {
+        const db = req.result;
+        db.onversionchange = () => { db.close(); dbPromise = null; };
+        db.onclose = () => { dbPromise = null; };
+        resolve(db);
+      };
+      req.onerror = () => { dbPromise = null; reject(req.error); };
     });
+    return dbPromise;
   }
   async function idbGet(store, key){
     const db = await idbOpen();
@@ -145,10 +161,29 @@
     });
   }
 
+  // Deletes every record whose (string) key starts with `prefix` — used to clear one folder's `folderId::path` entries.
+  async function idbDeleteByPrefix(store, prefix){
+    const db = await idbOpen();
+    return new Promise((resolve, reject) => {
+      const tx = db.transaction(store, "readwrite");
+      const req = tx.objectStore(store).openKeyCursor(IDBKeyRange.bound(prefix, prefix + "\uffff"));
+      req.onsuccess = () => {
+        const cursor = req.result;
+        if (!cursor) return;
+        tx.objectStore(store).delete(cursor.primaryKey);
+        cursor.continue();
+      };
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => reject(tx.error);
+    });
+  }
+
+  let toastTimer = null;
   function toast(msg){
     els.toast.textContent = msg;
     els.toast.classList.add("show");
-    setTimeout(() => els.toast.classList.remove("show"), 1800);
+    clearTimeout(toastTimer); // a newer toast must not be hidden by the previous one's timer
+    toastTimer = setTimeout(() => els.toast.classList.remove("show"), 1800);
   }
 
   // ---------- One-time migration: single folder (legacy) -> multi-folder ----------
@@ -296,10 +331,14 @@
   async function unlinkFolder(folderId){
     const rec = folders.find(f => f.id === folderId);
     await idbDelete(STORE_FOLDERS, folderId);
+    // Search index and hashes are rebuilt on the next scan, so don't leave them behind on disk.
+    await idbDeleteByPrefix(STORE_TEXT_INDEX, folderId + "::").catch(() => {});
+    await idbDeleteByPrefix(STORE_HASH_INDEX, folderId + "::").catch(() => {});
     await loadFolders();
     folderPermissionState.delete(folderId);
     allFiles = allFiles.filter(f => f.folderId !== folderId);
     for (const k of [...textIndex.keys()]) if (k.startsWith(folderId + "::")) textIndex.delete(k);
+    for (const k of [...foldedText.keys()]) if (k.startsWith(folderId + "::")) foldedText.delete(k);
     for (const k of [...hashIndex.keys()]) if (k.startsWith(folderId + "::")) hashIndex.delete(k);
     for (const k of Object.keys(favoritesMap)) if (k.startsWith(folderId + "::")) delete favoritesMap[k];
     if (activeFolderFilterId === folderId) activeFolderFilterId = null;
@@ -351,7 +390,7 @@
       <div class="modal-overlay">
         <div class="modal-box">
           <h2>🔒 Before you start</h2>
-          <p>This tool runs 100% in your browser. Nothing is uploaded, copied, or sent anywhere. There's no server, no account needed, and no internet connection required after this page loads.</p>
+          <p>This tool runs 100% in your browser. Your files are never uploaded, copied, or sent anywhere. There's no account needed, and no internet connection required after this page loads.</p>
           <p>In a moment your browser will ask you to confirm access to a folder. That's a standard security prompt built into Chrome/Edge, not something this site controls. You can revoke that access anytime from your browser's site settings.</p>
           <button class="primary" id="ackBtn">I understand, continue</button>
         </div>
@@ -370,7 +409,7 @@
           <button class="primary" id="pickBtn">📁 Select folder</button>
           <a class="button-like" id="githubLink" href="https://github.com/wramirezrg/siganor-search" target="_blank" rel="noopener noreferrer">⭐ View on GitHub</a>
         </div>
-        <p class="fine-print">🔒 Everything stays on your device. Nothing is ever uploaded, no account needed, no server involved.</p>
+        <p class="fine-print">🔒 Your files stay on your device. They are never uploaded, and no account is needed.</p>
       </div>`);
     const pickBtn = document.getElementById("pickBtn");
     pickBtn.onclick = linkFolder;
@@ -454,6 +493,8 @@
     favoritesMap = await loadFavoritesMap();
     await loadCollections();
     textIndex = await loadTextIndex();
+    foldedText = new Map();
+    warmFoldedIndex(); // fire-and-forget, in small slices
     hashIndex = await loadHashIndex();
     els.controlsRow.style.display = "flex";
     els.layout.style.display = "grid";
@@ -548,7 +589,7 @@
   }
   document.addEventListener("keydown", (e) => {
     const tag = (e.target.tagName || "").toLowerCase();
-    const inInput = tag === "input" || tag === "textarea";
+    const inInput = tag === "input" || tag === "textarea" || tag === "select";
 
     if (e.key === "/" && !inInput){
       e.preventDefault();
@@ -565,7 +606,7 @@
 
     if (e.key === "ArrowDown"){
       e.preventDefault();
-      selectedRowIndex = Math.min(selectedRowIndex + 1, lastResults.length - 1);
+      selectedRowIndex = Math.min(selectedRowIndex + 1, renderedCount - 1);
       updateRowSelection();
     } else if (e.key === "ArrowUp"){
       e.preventDefault();
@@ -578,7 +619,10 @@
   });
 
   function applyFilters(){
-    const q = els.search.value.trim().toLowerCase();
+    const q = fold(els.search.value.trim());
+    // Reset the "Show more" window only when the filter really changes (not on favorite toggles / index refreshes).
+    const sig = [q, activeFolderFilterId, activeCollectionId, activeCategory, favoritesOnly].join("|");
+    if (sig !== lastFilterSig){ lastFilterSig = sig; renderLimit = RENDER_STEP; }
     let results = allFiles;
     if (activeFolderFilterId){
       results = results.filter(f => f.folderId === activeFolderFilterId);
@@ -603,15 +647,15 @@
     const terms = q.split(/\s+/).filter(Boolean);
     const snippets = new Map();
     results = results.filter(f => {
-      const name = f.name.toLowerCase();
-      const path = f.path.toLowerCase();
-      const rec = textIndex.get(fileKey(f));
-      const text = rec ? rec.text.toLowerCase() : "";
-      const allMatch = terms.every(t => name.includes(t) || path.includes(t) || text.includes(t));
+      if (f._nf === undefined){ f._nf = fold(f.name); f._pf = fold(f.path); } // cached per file entry
+      const key = fileKey(f);
+      const rec = textIndex.get(key);
+      const hay = rec ? getFolded(key, rec) : "";
+      const allMatch = terms.every(t => f._nf.includes(t) || f._pf.includes(t) || hay.includes(t));
       if (!allMatch) return false;
       if (rec){
-        const snip = findSnippet(rec.text, terms);
-        if (snip) snippets.set(fileKey(f), snip);
+        const snip = findSnippet(rec.text, terms, hay);
+        if (snip) snippets.set(key, snip);
       }
       return true;
     });
@@ -632,13 +676,17 @@
   }
 
   function render(results, snippets){
-    lastResults = results;
+    lastResults = results;      // full list: Export list and keyboard nav use it, not just the drawn rows
+    lastSnippets = snippets;
     selectedRowIndex = -1;
     if (!results.length){
+      renderedCount = 0;
       setHTML(els.rootView, `<div class="empty">No results.</div>`);
       return;
     }
-    const rows = results.map((f, i) => {
+    const shown = results.slice(0, renderLimit);
+    renderedCount = shown.length;
+    const rows = shown.map((f, i) => {
       const canPreview = PREVIEWABLE.has(f.ext);
       const isFav = fileKey(f) in favoritesMap;
       const snippet = snippets && snippets.get(fileKey(f));
@@ -666,11 +714,21 @@
         <tbody>${rows}</tbody>
       </table>
       <footer>
-        <span>${results.length} result(s) out of ${allFiles.length} total files</span>
+        <span>${shown.length < results.length ? `Showing ${shown.length} of ${results.length} result(s)` : `${results.length} result(s)`} out of ${allFiles.length} total files</span>
+        ${shown.length < results.length ? `<button class="backup-btn" id="showMoreBtn" style="flex:none;">Show more</button>` : ""}
         <span>Last scan: ${lastScanAt ? lastScanAt.toLocaleTimeString() : "—"}</span>
       </footer>`);
 
     wireResultActions(els.rootView, results);
+    const showMoreBtn = document.getElementById("showMoreBtn");
+    if (showMoreBtn){
+      showMoreBtn.addEventListener("click", () => {
+        const scrollTop = els.rootView.scrollTop;
+        renderLimit += RENDER_STEP;
+        render(lastResults, lastSnippets);
+        els.rootView.scrollTop = scrollTop; // keep the reading position after appending rows
+      });
+    }
   }
 
   // ---------- Browse view: original folder structure, collapsible ----------
@@ -697,32 +755,48 @@
     </div>`;
   }
 
-  function renderTreeBranch(node, key, label, depth, order, htmlParts){
+  // Large result sets: don't put collapsed folders' files in the DOM. Their HTML (plain text) is kept in
+  // `deferred` and inserted when the folder is expanded. Below this size the tree renders exactly as before.
+  const TREE_LAZY_MIN = 2000;
+
+  // `deferred` is a Map (key -> body HTML) in lazy mode, or null. `order` is filled identically either way,
+  // so data-idx values, Export list and lastResults don't depend on what is currently in the DOM.
+  function renderTreeBranch(node, key, label, depth, order, htmlParts, deferred){
     const childNames = Array.from(node.children.keys()).sort((a, b) => a.localeCompare(b));
     const files = node.files.slice().sort((a, b) => a.name.localeCompare(b.name));
     const nextDepth = label !== null ? depth + 1 : depth;
+    const collapsed = label !== null && !expandedTreeNodes.has(key);
+    const defer = !!deferred && collapsed;
+    const bodyParts = defer ? [] : htmlParts;
     if (label !== null){
-      const collapsed = !expandedTreeNodes.has(key);
       htmlParts.push(`<div class="tree-folder ${collapsed ? "collapsed" : ""}" data-treekey="${escapeAttr(key)}">`);
       htmlParts.push(`<button class="tree-folder-toggle" data-treekey="${escapeAttr(key)}" style="--depth:${depth}">
         <span class="tree-chev">▾</span> 📁 <span class="tree-folder-name">${escapeHtml(label)}</span>
         <span class="tree-folder-count">${countTreeFiles(node)}</span>
       </button>`);
-      htmlParts.push(`<div class="tree-folder-body">`);
+      htmlParts.push(defer ? `<div class="tree-folder-body"></div>` : `<div class="tree-folder-body">`);
     }
     for (const name of childNames){
-      renderTreeBranch(node.children.get(name), key + "/" + name, name, nextDepth, order, htmlParts);
+      renderTreeBranch(node.children.get(name), key + "/" + name, name, nextDepth, order, bodyParts, deferred);
     }
     files.forEach(f => {
       const idx = order.length;
       order.push(f);
-      htmlParts.push(treeFileRowHtml(f, idx, nextDepth));
+      bodyParts.push(treeFileRowHtml(f, idx, nextDepth));
     });
-    if (label !== null) htmlParts.push(`</div></div>`);
+    if (label !== null){
+      if (defer){
+        deferred.set(key, bodyParts.join(""));
+        htmlParts.push(`</div>`);
+      } else {
+        htmlParts.push(`</div></div>`);
+      }
+    }
   }
 
   function renderTree(results){
     lastResults = [];
+    renderedCount = 0;
     selectedRowIndex = -1;
     if (!results.length){
       setHTML(els.rootView, `<div class="empty">No results.</div>`);
@@ -750,13 +824,15 @@
     const showFolderHeader = byFolder.size > 1;
     const order = [];
     const htmlParts = [];
+    const deferred = results.length > TREE_LAZY_MIN ? new Map() : null;
     Array.from(byFolder.entries())
       .sort((a, b) => a[1].name.localeCompare(b[1].name))
       .forEach(([folderId, entry]) => {
-        renderTreeBranch(entry.root, "root::" + folderId, showFolderHeader ? entry.name : null, 0, order, htmlParts);
+        renderTreeBranch(entry.root, "root::" + folderId, showFolderHeader ? entry.name : null, 0, order, htmlParts, deferred);
       });
 
     lastResults = order;
+    renderedCount = order.length;
     setHTML(els.rootView, `
       <div class="tree-view">${htmlParts.join("")}</div>
       <footer>
@@ -765,19 +841,33 @@
       </footer>`);
 
     wireResultActions(els.rootView, order);
-    els.rootView.querySelectorAll(".tree-folder-toggle").forEach(btn => {
-      btn.addEventListener("click", () => {
-        const key = btn.dataset.treekey;
-        if (expandedTreeNodes.has(key)) expandedTreeNodes.delete(key); else expandedTreeNodes.add(key);
-        btn.closest(".tree-folder").classList.toggle("collapsed");
+    function wireTreeToggles(container){
+      container.querySelectorAll(".tree-folder-toggle").forEach(btn => {
+        btn.addEventListener("click", () => {
+          const key = btn.dataset.treekey;
+          const folderEl = btn.closest(".tree-folder");
+          if (deferred && deferred.has(key)){
+            // First expand of a lazily rendered folder: build its rows now and wire their buttons/sub-folders.
+            const body = folderEl.querySelector(":scope > .tree-folder-body");
+            setHTML(body, deferred.get(key));
+            deferred.delete(key);
+            wireResultActions(body, order);
+            wireTreeToggles(body);
+          }
+          if (expandedTreeNodes.has(key)) expandedTreeNodes.delete(key); else expandedTreeNodes.add(key);
+          folderEl.classList.toggle("collapsed");
+        });
       });
-    });
+    }
+    wireTreeToggles(els.rootView);
   }
 
   async function viewFile(entry){
     try{
       const file = await entry.handle.getFile();
-      const url = URL.createObjectURL(file);
+      // HTML from the user's folder is shown as source text, never interpreted as a page of this origin.
+      const isHtml = entry.ext === "htm" || entry.ext === "html";
+      const url = URL.createObjectURL(isHtml ? new Blob([file], { type: "text/plain;charset=utf-8" }) : file);
       if (PREVIEWABLE.has(entry.ext)){
         window.open(url, "_blank");
       } else {
@@ -836,11 +926,86 @@
   }
 
   // ---------- Backup / restore (favorites + collections only) ----------
+  const BACKUP_MAX_BYTES = 5 * 1024 * 1024;
+  const BACKUP_MAX_FAVORITES = 50000;
+  const BACKUP_MAX_COLLECTIONS = 2000;
+
+  // Pure (no DOM/IndexedDB): validates a backup file and re-targets it at the folders linked HERE.
+  // Folder ids are per-browser UUIDs, so a backup from another browser is matched by folder name.
+  // The file is untrusted input: only known fields are copied, with their types checked.
+  //   linked        [{ id, name }]  folders currently linked
+  //   keptIds       Set of collection ids that stay in place (so imported ones must not reuse them)
+  //   newId         () => fresh id
+  function remapBackup(data, linked, keptIds, newId){
+    if (!data || typeof data !== "object" || Array.isArray(data)
+        || !data.favorites || typeof data.favorites !== "object" || Array.isArray(data.favorites)
+        || !Array.isArray(data.collections)){
+      return { ok: false, error: "That file doesn't look like a doc-search backup." };
+    }
+    if (Object.keys(data.favorites).length > BACKUP_MAX_FAVORITES || data.collections.length > BACKUP_MAX_COLLECTIONS){
+      return { ok: false, error: "That backup is too large to import." };
+    }
+    const names = (data.folders && typeof data.folders === "object" && !Array.isArray(data.folders)) ? data.folders : {};
+    const linkedIds = new Set(linked.map(f => f.id));
+    const byName = new Map(); // lowercased name -> id, or null when two linked folders share the name
+    for (const f of linked){
+      const n = String(f.name).toLowerCase();
+      byName.set(n, byName.has(n) ? null : f.id);
+    }
+    const cache = new Map();
+    const skippedFolders = new Set();
+    function resolve(oldId){
+      if (cache.has(oldId)) return cache.get(oldId);
+      let target = null;
+      if (linkedIds.has(oldId)) target = oldId;
+      else if (typeof names[oldId] === "string") target = byName.get(names[oldId].toLowerCase()) || null;
+      if (!target) skippedFolders.add(typeof names[oldId] === "string" ? names[oldId] : "(unknown folder)");
+      cache.set(oldId, target);
+      return target;
+    }
+
+    const targets = new Set();
+    for (const oldId of Object.keys(names)){ const t = resolve(oldId); if (t) targets.add(t); }
+
+    const favorites = {};       // newFolderId::path -> ts
+    let favCount = 0, skipped = 0;
+    for (const [key, ts] of Object.entries(data.favorites)){
+      const sep = key.indexOf("::");
+      const target = sep > 0 ? resolve(key.slice(0, sep)) : null;
+      const path = sep > 0 ? key.slice(sep + 2) : "";
+      if (!target || !path || typeof ts !== "number" || !Number.isFinite(ts)){ skipped++; continue; }
+      favorites[target + "::" + path] = ts;
+      targets.add(target);
+      favCount++;
+    }
+
+    const used = new Set(keptIds);
+    const cols = [];
+    for (const c of data.collections){
+      const target = (c && typeof c.folderId === "string") ? resolve(c.folderId) : null;
+      if (!target || typeof c.name !== "string" || !c.name.trim() || !Array.isArray(c.paths)){ skipped++; continue; }
+      let id = (typeof c.id === "string" && c.id && !used.has(c.id)) ? c.id : newId();
+      used.add(id);
+      cols.push({
+        id, folderId: target, name: c.name.trim().slice(0, 200),
+        createdAt: (typeof c.createdAt === "number" && Number.isFinite(c.createdAt)) ? c.createdAt : Date.now(),
+        paths: c.paths.filter(p => typeof p === "string" && p),
+      });
+      targets.add(target);
+    }
+    return { ok: true, favorites, favCount, collections: cols, targets, skipped, skippedFolders: [...skippedFolders] };
+  }
+
   function exportBackup(){
+    const linkedIds = new Set(folders.map(f => f.id));
+    const folderNames = {};
+    folders.forEach(f => { folderNames[f.id] = f.name; });
     const payload = {
+      version: 2,
       exportedAt: new Date().toISOString(),
+      folders: folderNames, // lets another browser match by name, since folder ids are local
       favorites: favoritesMap,
-      collections: collections,
+      collections: collections.filter(c => linkedIds.has(c.folderId)),
     };
     const blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" });
     const url = URL.createObjectURL(blob);
@@ -853,6 +1018,10 @@
   }
 
   async function importBackup(file){
+    if (file.size > BACKUP_MAX_BYTES){
+      toast("That backup file is too large to import.");
+      return;
+    }
     let data;
     try{
       data = JSON.parse(await file.text());
@@ -860,31 +1029,44 @@
       toast("Backup file isn't valid JSON.");
       return;
     }
-    if (!data || typeof data.favorites !== "object" || data.favorites === null || !Array.isArray(data.collections)){
-      toast("That file doesn't look like a doc-search backup.");
+    // Collections outside the folders this backup covers stay untouched, so their ids can't be reused.
+    const preview = remapBackup(data, folders, new Set(), () => "");
+    if (!preview.ok){ toast(preview.error); return; }
+    if (!preview.targets.size){
+      toast(preview.skippedFolders.length
+        ? `Nothing to restore: link these folders first (${preview.skippedFolders.join(", ")}).`
+        : "That backup has nothing to restore.");
       return;
     }
-    const favCount = Object.keys(data.favorites).length;
-    if (!confirm(`Replace current favorites (${favCount}) and collections (${data.collections.length}) with this backup? This can't be undone.`)){
+    const keptIds = new Set(collections.filter(c => !preview.targets.has(c.folderId)).map(c => c.id));
+    const result = remapBackup(data, folders, keptIds, () => crypto.randomUUID());
+
+    const targetNames = folders.filter(f => result.targets.has(f.id)).map(f => f.name).join(", ");
+    const skippedNote = result.skipped || result.skippedFolders.length
+      ? `\n\n${result.skipped} item(s) will be skipped` + (result.skippedFolders.length ? ` (folder not linked here: ${result.skippedFolders.join(", ")})` : "") + "."
+      : "";
+    if (!confirm(`Replace favorites and collections of ${targetNames} with this backup (${result.favCount} favorite(s), ${result.collections.length} collection(s))? Other folders are not touched. This can't be undone.${skippedNote}`)){
       return;
     }
+
     for (const col of collections){
-      await idbDelete(STORE_COLLECTIONS, col.id);
+      if (result.targets.has(col.folderId)) await idbDelete(STORE_COLLECTIONS, col.id);
     }
-    for (const col of data.collections){
-      // Only restore collections whose folder is still linked here — a collection from a
-      // backup taken on a different set of linked folders has nowhere valid to attach.
-      if (!col.folderId || !folders.some(f => f.id === col.folderId)) continue;
+    for (const col of result.collections){
       await idbSet(STORE_COLLECTIONS, col.id, col);
     }
-    favoritesMap = data.favorites;
-    await persistAllFavorites();
+    for (const key of Object.keys(favoritesMap)){
+      const sep = key.indexOf("::");
+      if (sep > 0 && result.targets.has(key.slice(0, sep))) delete favoritesMap[key];
+    }
+    Object.assign(favoritesMap, result.favorites);
+    for (const folderId of result.targets) await persistFavorites(folderId);
 
     await loadCollections();
     buildCategoryChips();
     applyFilters();
     await renderSidebar();
-    toast("Backup restored.");
+    toast(`Backup restored: ${result.favCount} favorite(s), ${result.collections.length} collection(s)` + (result.skipped ? `, ${result.skipped} skipped.` : "."));
   }
 
   // ---------- Favorites ----------
@@ -1101,6 +1283,7 @@
               const record = { path: entry.path, folderId: entry.folderId, text, size: file.size, lastModified: file.lastModified, indexedAt: Date.now() };
               await idbSet(STORE_TEXT_INDEX, key, record);
               textIndex.set(key, record);
+              foldedText.delete(key); // re-folded lazily on next search
               indexedCount++;
             }
           }
@@ -1157,14 +1340,46 @@
     hashQueueDone = 0;
     updateStatusLine();
 
+    // Pass 1 (metadata only): identical files always have the same size, so a file whose size is
+    // unique can't be a duplicate and never needs to be read in full.
+    const bySize = new Map(); // size -> [{ entry, lastModified }]
     for (const entry of candidates){
       if (scanGeneration !== myGeneration){ hashingActive = false; return; } // folder set changed mid-run
-
       try{
         const file = await entry.handle.getFile();
+        if (!bySize.has(file.size)) bySize.set(file.size, []);
+        bySize.get(file.size).push({ entry, size: file.size, lastModified: file.lastModified });
+      }catch(e){
+        // unreadable file — skip, not fatal to the rest of the queue
+      }
+      hashQueueDone++;
+      updateStatusLine();
+      await new Promise(r => setTimeout(r, 0));
+    }
+
+    const toHash = [];
+    for (const group of bySize.values()){
+      if (group.length > 1){ toHash.push(...group); continue; }
+      // Unique size: drop any stale hash record (changed file) so groupDuplicates can't build a false group from it.
+      const { entry, size, lastModified } = group[0];
+      const key = fileKey(entry);
+      const cached = hashIndex.get(key);
+      if (cached && (cached.size !== size || cached.lastModified !== lastModified)){
+        hashIndex.delete(key);
+        try{ await idbDelete(STORE_HASH_INDEX, key); }catch(e){ /* stale record stays on disk, ignored in memory */ }
+      }
+    }
+
+    // Pass 2: hash only the files that share a size with another file (reusing still-valid cached hashes).
+    hashQueueTotal = candidates.length + toHash.length;
+    for (const item of toHash){
+      if (scanGeneration !== myGeneration){ hashingActive = false; return; }
+      const { entry } = item;
+      try{
         const key = fileKey(entry);
         const cached = hashIndex.get(key);
-        if (!cached || cached.size !== file.size || cached.lastModified !== file.lastModified){
+        if (!cached || cached.size !== item.size || cached.lastModified !== item.lastModified){
+          const file = await entry.handle.getFile();
           const hash = await hashFile(file);
           const record = { path: entry.path, folderId: entry.folderId, hash, size: file.size, lastModified: file.lastModified, hashedAt: Date.now() };
           await idbSet(STORE_HASH_INDEX, key, record);
@@ -1185,11 +1400,40 @@
     if (hashQueuePending){ hashQueuePending = false; runHashQueue(); }
   }
 
-  function findSnippet(text, terms){
-    const lower = text.toLowerCase();
+  // ---------- Accent/case-insensitive matching ----------
+  // "ñ" is kept distinct from "n" (año != ano); every other accent is dropped. Length is preserved
+  // for normal (precomposed) text, which lets snippets be cut from the original with its accents.
+  function fold(s){
+    return s.toLowerCase().replace(/\u00f1|n\u0303/g, "\u0001").normalize("NFD").replace(/[\u0300-\u036f]/g, "");
+  }
+
+  function getFolded(key, rec){
+    let f = foldedText.get(key);
+    if (f === undefined){ f = fold(rec.text); foldedText.set(key, f); }
+    return f;
+  }
+
+  // Pre-folds the loaded index in small time slices so the first search doesn't have to do it all at once.
+  async function warmFoldedIndex(){
+    const myGeneration = scanGeneration;
+    let deadline = performance.now() + 8;
+    for (const [key, rec] of textIndex){
+      if (scanGeneration !== myGeneration) return;
+      getFolded(key, rec);
+      if (performance.now() > deadline){
+        await new Promise(r => setTimeout(r, 0));
+        deadline = performance.now() + 8;
+      }
+    }
+  }
+
+  // `hay` is the folded text (see getFolded). Matching runs on it; the fragment shown to the user is cut
+  // from the original text when both have the same length (keeps accents), otherwise from `hay`.
+  function findSnippet(text, terms, hay){
+    if (hay.length !== text.length) text = hay;
     let firstIdx = -1;
     for (const t of terms){
-      const i = lower.indexOf(t);
+      const i = hay.indexOf(t);
       if (i !== -1 && (firstIdx === -1 || i < firstIdx)) firstIdx = i;
     }
     if (firstIdx === -1) return null;
@@ -1199,7 +1443,7 @@
     const prefix = start > 0 ? "…" : "";
     const suffix = end < text.length ? "…" : "";
     const slice = text.slice(start, end);
-    const lowerSlice = slice.toLowerCase();
+    const lowerSlice = hay.slice(start, end);
 
     const ranges = [];
     for (const t of terms){
@@ -1559,7 +1803,7 @@
       btn.addEventListener("click", async (e) => {
         e.stopPropagation();
         const f = folders.find(x => x.id === btn.dataset.folderid);
-        if (f && confirm(`Unlink folder "${f.name}"? It disappears from this list, but its favorites, collections, and history stay saved in case you link it again.`)){
+        if (f && confirm(`Unlink folder "${f.name}"? It disappears from this list and its search index is cleared. Favorites and collections are tied to this link, so linking the same folder again starts them fresh. Your files are not touched.`)){
           await unlinkFolder(btn.dataset.folderid);
         }
       });
@@ -1567,6 +1811,47 @@
     const linkFolderBtn = document.getElementById("linkFolderBtn");
     if (linkFolderBtn) linkFolderBtn.addEventListener("click", linkFolder);
   }
+
+  // ---------- Banner auto-hide (desktop: panels scroll, not the page) ----------
+  // Collapses the promo banner once a panel is scrolled, and restores it when both are back at the top.
+  // The overflow check keeps a nearly-fitting panel from flapping: hiding the banner grows the panel,
+  // which would clamp scrollTop to 0 and re-show it.
+  function initBannerAutoHide(){
+    const banner = document.querySelector(".promo-banner");
+    const panes = [els.sidebar, els.rootView];
+    const ANIM_MS = 650; // a bit above the CSS height transition (.6s)
+    let queued = false;
+    let hidden = false;
+    let settleTimer = null;
+    // Animates an explicit pixel height: 'height:auto' can't be transitioned, so start from the
+    // current measured height (works even if a previous animation was interrupted midway).
+    function setBannerHidden(next){
+      if (next === hidden) return;
+      hidden = next;
+      clearTimeout(settleTimer);
+      banner.style.height = banner.getBoundingClientRect().height + "px";
+      void banner.offsetHeight; // commit the starting height before changing it
+      document.body.classList.toggle("banner-hidden", hidden);
+      if (hidden){
+        banner.style.height = "0px";
+      } else {
+        banner.style.height = banner.scrollHeight + "px"; // natural content height
+        settleTimer = setTimeout(() => { banner.style.height = ""; }, ANIM_MS); // back to auto so it follows window width
+      }
+    }
+    function update(){
+      queued = false;
+      const bannerH = banner.scrollHeight; // natural height; unlike offsetHeight it doesn't change while collapsing
+      const scrolled = panes.some(p => p.scrollTop > 20 && p.scrollHeight - p.clientHeight > bannerH + 50);
+      const atTop = panes.every(p => p.scrollTop === 0);
+      if (scrolled) setBannerHidden(true);
+      else if (atTop) setBannerHidden(false);
+    }
+    panes.forEach(p => p.addEventListener("scroll", () => {
+      if (!queued){ queued = true; requestAnimationFrame(update); }
+    }, { passive: true }));
+  }
+  initBannerAutoHide();
 
   // ---------- Startup ----------
   async function init(){

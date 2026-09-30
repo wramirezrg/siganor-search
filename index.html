@@ -19,7 +19,7 @@
     background:var(--bg); color:var(--text);
   }
   header{
-    padding:20px 28px 14px; border-bottom:1px solid var(--border); background:var(--panel);
+    padding:20px 14px 14px; border-bottom:1px solid var(--border); background:var(--panel);
     position:sticky; top:0; z-index:5;
   }
   h1{margin:0 0 4px; font-size:19px; font-weight:650;}
@@ -41,11 +41,35 @@
   button.primary{background:var(--accent); color:var(--accent-text); border-color:var(--accent); font-weight:600;}
   button:hover{filter:brightness(1.05);}
   button:disabled{opacity:.5; cursor:default;}
-  main{padding:18px 28px 40px; max-width:1400px; margin:0 auto;}
+  main{padding:18px 14px 40px; max-width:1800px; margin:0 auto;}
   .layout{display:grid; grid-template-columns:280px 1fr; gap:20px; align-items:start;}
   .sidebar{
-    display:flex; flex-direction:column; gap:14px; position:sticky; top:118px;
-    max-height:calc(100vh - 118px - 20px); overflow-y:auto;
+    display:flex; flex-direction:column; gap:14px;
+  }
+  /* Desktop "app shell": the page itself never scrolls; sidebar and results each scroll on their own,
+     so the sidebar can't be pushed out of view (sticky would be, at the end of the page). */
+  @media (min-width:861px){
+    html, body{ height:100vh; overflow:hidden; }
+    body{ display:flex; flex-direction:column; }
+    .promo-banner, header, #siteFooter{ flex:none; }
+    header{ position:static; }
+    #siteFooter{ padding:8px 14px; margin-top:0; }
+    main{
+      flex:1; min-height:0; width:100%; display:flex; flex-direction:column;
+      overflow:hidden; padding-bottom:12px;
+    }
+    #status, #indexStatus{ flex:none; }
+    #introView{ flex:none; }
+    #introView:not(:empty){ flex:1; min-height:0; overflow-y:auto; }
+    /* Smooth collapse: app.js animates an explicit pixel height (see initBannerAutoHide); the fade is CSS */
+    .promo-banner{
+      overflow:hidden;
+      transition:height .6s cubic-bezier(.4,0,.2,1), opacity .45s ease;
+    }
+    body.banner-hidden .promo-banner{ opacity:0; }
+    @media (prefers-reduced-motion:reduce){ .promo-banner{ transition:none; } }
+    .layout{ flex:1; min-height:0; align-items:stretch; }
+    .sidebar, #rootView{ min-height:0; height:100%; overflow-y:auto; overscroll-behavior:contain; }
   }
   @media (max-width:860px){
     .layout{ grid-template-columns:1fr; }
@@ -167,11 +191,32 @@
   }
   .toast.show{opacity:1;}
   code{background:var(--chip-bg); padding:1px 6px; border-radius:6px; font-size:12.5px;}
-  .promo-banner{ display:block; border-bottom:1px solid #2a2a1f; line-height:0; }
-  .promo-banner-img{ width:100%; height:auto; display:block; }
-  #siteFooter{ border-top:1px solid var(--border); padding:18px 28px; margin-top:12px; }
+  .promo-banner{
+    display:block; border-bottom:1px solid var(--border);
+    background:linear-gradient(90deg, var(--panel) 0%, var(--panel) 55%, #211d10 100%);
+  }
+  .promo-inner{
+    max-width:1800px; margin:0 auto; padding:8px 14px;
+    display:flex; align-items:center; gap:12px; flex-wrap:wrap;
+  }
+  .promo-brand{ display:inline-flex; align-items:center; gap:8px; color:var(--accent); text-decoration:none; }
+  .promo-logo{ width:22px; height:22px; border-radius:5px; display:block; }
+  .promo-name{ font-weight:800; font-size:14px; letter-spacing:.14em; }
+  .promo-tag, .promo-msg{ color:var(--muted); font-size:12.5px; }
+  .promo-msg{ color:var(--text); }
+  .promo-spacer{ flex:1; }
+  .promo-cta{
+    padding:5px 14px; border-radius:999px; background:var(--accent); color:var(--accent-text);
+    font-size:12.5px; font-weight:700; text-decoration:none; white-space:nowrap;
+  }
+  .promo-cta:hover{ filter:brightness(1.05); }
+  @media (max-width:860px){
+    .promo-inner{ padding:8px 16px; }
+    .promo-tag, .promo-msg{ display:none; }
+  }
+  #siteFooter{ border-top:1px solid var(--border); padding:18px 14px; margin-top:12px; }
   .footer-inner{
-    max-width:1400px; margin:0 auto; display:flex; gap:10px; flex-wrap:wrap;
+    max-width:1800px; margin:0 auto; display:flex; gap:10px; flex-wrap:wrap;
     justify-content:center; align-items:center; color:var(--muted); font-size:12.5px;
   }
   #siteFooter a{ color:var(--accent); text-decoration:none; }
@@ -254,9 +299,18 @@
 </head>
 <body>
 
-<a class="promo-banner" href="https://www.siganor.com" target="_blank" rel="noopener noreferrer">
-  <img class="promo-banner-img" src="img/siganor-banner.svg" alt="Siganor: Signal Analysis &amp; Operational Reliability">
-</a>
+<div class="promo-banner">
+  <div class="promo-inner">
+    <a class="promo-brand" href="https://www.siganor.com" target="_blank" rel="noopener noreferrer">
+      <img class="promo-logo" src="img/siganor-icon.png" alt="" width="22" height="22">
+      <span class="promo-name">SIGANOR</span>
+    </a>
+    <span class="promo-tag">Signal Analysis &amp; Operational Reliability</span>
+    <span class="promo-spacer"></span>
+    <span class="promo-msg">Set up in under 2 minutes.</span>
+    <a class="promo-cta" href="https://www.siganor.com" target="_blank" rel="noopener noreferrer">Learn more &rarr;</a>
+  </div>
+</div>
 
 <header>
   <h1><svg class="icon-search" viewBox="0 0 24 24" width="22" height="22" aria-hidden="true">
@@ -287,7 +341,7 @@
 
 <footer id="siteFooter">
   <div class="footer-inner">
-    <span>🔒 100% local. Nothing is ever uploaded.</span>
+    <span>🔒 Your files never leave your device.</span>
     <span class="footer-sep">·</span>
     <span>Built &amp; maintained by <strong>Wilmer Ramirez Gutierrez</strong></span>
     <span class="footer-sep">·</span>
