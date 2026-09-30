@@ -4,7 +4,7 @@
   // Pure logic lives in js/*.js (classic scripts loaded before this file, see index.html).
   // If only part of the site was uploaded, say so instead of failing silently.
   const DS = window.DocSearch || {};
-  if (!DS.text || !DS.ranking || !DS.backup || !DS.tree || !DS.db){
+  if (!DS.text || !DS.ranking || !DS.backup || !DS.tree || !DS.db || !DS.settings){
     const status = document.getElementById("status");
     if (status){
       status.textContent = "Some app files failed to load (js/*.js). Upload the whole folder and reload the page.";
@@ -14,6 +14,7 @@
   }
   const { fold, findSnippet, escapeHtml, escapeAttr, relativeTime, tokenize } = DS.text;
   const { scoreMatch } = DS.ranking;
+  const { loadSettings, saveSettings, planOpen } = DS.settings;
   const { remapBackup, BACKUP_MAX_BYTES } = DS.backup;
   const {
     KEY,
@@ -85,6 +86,7 @@
     sortSelect: document.getElementById("sortSelect"),
     refreshBtn: document.getElementById("refreshBtn"),
     exportBtn: document.getElementById("exportBtn"),
+    settingsBtn: document.getElementById("settingsBtn"),
     chips: document.getElementById("chips"),
     toast: document.getElementById("toast"),
     indexStatus: document.getElementById("indexStatus"),
@@ -783,8 +785,10 @@
       // HTML from the user's folder is shown as source text, never interpreted as a page of this origin.
       const isHtml = entry.ext === "htm" || entry.ext === "html";
       const url = URL.createObjectURL(isHtml ? new Blob([file], { type: "text/plain;charset=utf-8" }) : file);
-      if (PREVIEWABLE.has(entry.ext)){
-        window.open(url, "_blank");
+      // PDFs follow the user's setting (browser viewer, or a download the system opens with its default PDF app).
+      const plan = planOpen(entry.ext, settings);
+      if (plan.action !== "download" && PREVIEWABLE.has(entry.ext)){
+        window.open(url + plan.hash, "_blank");
       } else {
         const a = document.createElement("a");
         a.href = url; a.download = entry.name;
@@ -796,6 +800,78 @@
       toast("Couldn't open: " + e.message);
     }
   }
+
+  // ---------- Settings (how PDF files are opened) ----------
+  function getStorage(){ try{ return window.localStorage; }catch(e){ return null; } }
+  let settings = loadSettings(getStorage());
+
+  // Modal dialog; changes are saved as soon as they're made. Esc / backdrop / Close dismiss it and focus returns to the button.
+  function openSettingsDialog(opener){
+    if (document.getElementById("settingsDialog")) return;
+    const overlay = document.createElement("div");
+    overlay.className = "modal-overlay";
+    overlay.id = "settingsDialog";
+    setHTML(overlay, `
+      <div class="modal-box" role="dialog" aria-modal="true" aria-labelledby="settingsTitle">
+        <h2 id="settingsTitle">⚙ Settings</h2>
+        <fieldset>
+          <legend>How to open PDF files</legend>
+          <label class="opt">
+            <input type="radio" name="pdfMode" value="browser">
+            <span>Open in the browser viewer<small>Opens in a new tab with your browser's built-in PDF viewer.</small></span>
+          </label>
+          <label class="opt opt-sub" id="sidePanelOpt">
+            <input type="checkbox" id="pdfSidePanel">
+            <span>Show the side panel (bookmarks / thumbnails) when available<small>Asks the viewer to open its side panel. Some browsers ignore this.</small></span>
+          </label>
+          <label class="opt">
+            <input type="radio" name="pdfMode" value="download">
+            <span>Download and open with my system's default app<small>Your system opens the PDF with its default PDF app. A copy is saved in your Downloads folder. To use a different app, change the default PDF app in your system settings. A web page can't pick an installed app itself.</small></span>
+          </label>
+        </fieldset>
+        <button type="button" class="primary" id="settingsClose">Close</button>
+      </div>`);
+    document.body.appendChild(overlay);
+
+    const radios = Array.from(overlay.querySelectorAll('input[name="pdfMode"]'));
+    const panel = overlay.querySelector("#pdfSidePanel");
+    const panelOpt = overlay.querySelector("#sidePanelOpt");
+    function paint(){
+      radios.forEach(r => { r.checked = r.value === settings.pdfMode; });
+      panel.checked = settings.pdfSidePanel;
+      const off = settings.pdfMode === "download"; // the side panel only applies to the browser viewer
+      panel.disabled = off;
+      panelOpt.classList.toggle("is-disabled", off);
+    }
+    paint();
+    radios.forEach(r => r.addEventListener("change", () => {
+      settings = saveSettings(getStorage(), { ...settings, pdfMode: r.value });
+      paint();
+      toast(settings.pdfMode === "download" ? "PDFs will be downloaded and opened by your system." : "PDFs will open in the browser viewer.");
+    }));
+    panel.addEventListener("change", () => {
+      settings = saveSettings(getStorage(), { ...settings, pdfSidePanel: panel.checked });
+    });
+
+    function close(){
+      overlay.remove();
+      document.removeEventListener("keydown", onKey, true);
+      if (opener && opener.focus) opener.focus();
+    }
+    function onKey(e){
+      if (e.key === "Escape"){ e.preventDefault(); e.stopPropagation(); close(); return; }
+      if (e.key !== "Tab") return;
+      const items = Array.from(overlay.querySelectorAll("input:not(:disabled), button"));
+      const first = items[0], last = items[items.length - 1];
+      if (e.shiftKey && document.activeElement === first){ e.preventDefault(); last.focus(); }
+      else if (!e.shiftKey && document.activeElement === last){ e.preventDefault(); first.focus(); }
+    }
+    document.addEventListener("keydown", onKey, true);
+    overlay.addEventListener("click", (e) => { if (e.target === overlay) close(); });
+    overlay.querySelector("#settingsClose").addEventListener("click", close);
+    (radios.find(r => r.checked) || radios[0]).focus();
+  }
+  els.settingsBtn.addEventListener("click", () => openSettingsDialog(els.settingsBtn));
 
   // ---------- Open history ----------
   async function logOpen(entry){

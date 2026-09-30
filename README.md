@@ -21,6 +21,7 @@ Most "document search" tools either need a server, an installed app, or send you
 - **Keyboard shortcuts**  `/` to search, `Esc` to clear, `↑`/`↓` + `Enter` to browse results.
 - **Export** the current filtered results as a Markdown list.
 - **Backup & restore** favorites/collections as a `.json` file.
+- **Settings** choose how PDFs open: in the browser's built-in viewer (optionally asking for its side panel with the bookmarks), or as a download that your system opens with its default PDF app. A web page can't launch a specific installed app, so the default one is the only app choice. The setting is stored in your browser only.
 
 ## Privacy
 
@@ -48,7 +49,7 @@ No build step, no dependencies to install. `index.html`, `app.js` (keep them tog
 
 ## Development
 
-There is no build step and no dependencies. The code is split into small classic scripts so the page still works when opened straight from disk: `app.js` holds the state, scanning and rendering, while the pure logic lives in `js/` (`text.js` accent-insensitive matching and snippets, `ranking.js` relevance scoring, `backup.js` backup import validation, `tree.js` the lazy folder tree, `db.js` IndexedDB helpers). Run all the regression tests with `node tests/run-all.js` (they also check that `index.html` loads every file in `js/` and that the app boots). The `tests/` folder isn't needed to host the site.
+There is no build step and no dependencies. The code is split into small classic scripts so the page still works when opened straight from disk: `app.js` holds the state, scanning and rendering, while the pure logic lives in `js/` (`text.js` accent-insensitive matching and snippets, `ranking.js` relevance scoring, `backup.js` backup import validation, `tree.js` the lazy folder tree, `db.js` IndexedDB helpers, `settings.js` user settings). Run all the regression tests with `node tests/run-all.js` (they also check that `index.html` loads every file in `js/` and that the app boots). The `tests/` folder isn't needed to host the site.
 
 ## License
 
