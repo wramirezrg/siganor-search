@@ -1,0 +1,9 @@
+pdf.js (pdfjs-dist) 6.4.299, Apache License 2.0 (LICENSE in this folder)
+source: https://registry.npmjs.org/pdfjs-dist/-/pdfjs-dist-6.4.299.tgz
+npm-integrity: sha512-AVl138zALtfaAPvADulE0PZThbYzCBS79nL4pOSL/6Sm/4AH5A21BD9VHt97OlCuzJuCpmeZtAtkinisF4Vb1g==
+The .mjs files are build/pdf.min.mjs and build/pdf.worker.min.mjs, unchanged; the .classic.js files are generated
+from them by tools/vendor-pdfjs.js. Update all four together.
+sha256 pdf.min.mjs 57456c8e0c81e46be31174b499ef77f2b9f5ee46d04412ba627320a36755d4c2
+sha256 pdf.worker.min.mjs 9536359f1b8367850d485731ca1d5e45c159a7b7a0912325e539937aa21ceb18
+sha256 pdf.classic.js e0e821c511651a8e0ee4ca4bb3fa21f9ea6d5bae98cb04134c728af28aacccc0
+sha256 pdf.worker.classic.js a84bc9d9301268cac0a7fcbd19b98cefb383df489d715aab237f7727e5780f2a

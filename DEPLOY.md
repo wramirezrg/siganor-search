@@ -16,6 +16,8 @@ No build step, no dependencies. This is just static files. Any static host works
 
 The `_headers` file sets a strict Content Security Policy, HSTS, and a few other hardening headers. The policy allows `static.cloudflareinsights.com` and `cloudflareinsights.com` only for Cloudflare Web Analytics; if you host your own copy and don't use it, remove those two hosts from the CSP here and in the `<meta>` tag of `index.html`. It only works on hosts that read that specific format, like Cloudflare Pages or Netlify. GitHub Pages ignores it, so a plain GitHub Pages deployment runs without those extra headers. If you want them, host on Cloudflare Pages or Netlify instead: drag-and-drop the same files through that host's dashboard ("Upload assets" or manual deploy), then confirm the headers are being sent with `curl -I` or your browser's dev tools.
 
+When you upload by drag-and-drop, upload the files and folders listed above, not the whole project folder: a copy cloned with git has a hidden `.git` folder that must not be published.
+
 ## Updating it later
 
 - **GitHub Pages**: edit a file directly on GitHub (pencil icon) for small changes, or use **Add file → Upload files** again to swap a whole file. It redeploys automatically within a minute or two.

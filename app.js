@@ -23,8 +23,35 @@
     idbGet, idbSet, idbGetAll, idbDelete, idbDeleteByPrefix,
   } = DS.db;
 
-  if (window.pdfjsLib){
-    pdfjsLib.GlobalWorkerOptions.workerSrc = "vendor/pdfjs/pdf.worker.min.js";
+  // pdf.js (vendor/pdfjs, an ES module) loads the first time a PDF is indexed. Version and checksum: vendor/pdfjs/VERSION.
+  // Opened from disk (file://), the browser refuses ES modules: the classic copies made by tools/vendor-pdfjs.js load
+  // instead, and pdf.js runs its worker code on the page itself (globalThis.pdfjsWorker).
+  const PDFJS_SRC = "vendor/pdfjs/pdf.min.mjs";
+  const PDFJS_WORKER_SRC = "vendor/pdfjs/pdf.worker.min.mjs";
+  const PDFJS_CLASSIC = ["vendor/pdfjs/pdf.worker.classic.js", "vendor/pdfjs/pdf.classic.js"];
+  let pdfjsPromise = null;
+  function loadClassicScript(src){
+    return new Promise((resolve, reject) => {
+      const s = document.createElement("script");
+      s.src = src;
+      s.onload = resolve;
+      s.onerror = () => reject(new Error("could not load " + src));
+      document.head.appendChild(s);
+    });
+  }
+  async function loadPdfjsClassic(){
+    for (const src of PDFJS_CLASSIC) await loadClassicScript(src);
+    for (let i = 0; i < 50 && !(window.pdfjsLib && window.pdfjsWorker); i++) await new Promise(r => setTimeout(r, 20));
+    if (!window.pdfjsLib) throw new Error("pdf.js did not start");
+    return window.pdfjsLib;
+  }
+  function loadPdfjs(){
+    if (!pdfjsPromise){
+      pdfjsPromise = (location.protocol === "file:" ? loadPdfjsClassic() : import("./" + PDFJS_SRC))
+        .then(m => { m.GlobalWorkerOptions.workerSrc = PDFJS_WORKER_SRC; return m; })
+        .catch(err => { console.warn("pdf.js could not be loaded:", err); pdfjsPromise = null; return null; });
+    }
+    return pdfjsPromise;
   }
 
   const ACTIVE_KEY = "activeFolderId";
@@ -33,8 +60,14 @@
   const ALL_VALUE = "all";
   const TEXT_INDEXABLE = new Set(["pdf","txt","htm","html"]);
   const MAX_PDF_INDEX_SIZE = 40 * 1024 * 1024; // skip huge PDFs (likely image scans, or pathologically slow)
+  const MAX_TEXT_INDEX_SIZE = 20 * 1024 * 1024; // .txt/.html larger than this are found by name only (memory and IndexedDB)
 
   const PREVIEWABLE = new Set(["pdf","png","jpg","jpeg","gif","webp","txt","htm","html"]);
+  // The type of a preview is set here, never guessed by the browser from the file: text stays text, HTML is shown as source.
+  const PREVIEW_TYPE = {
+    pdf: "application/pdf", png: "image/png", jpg: "image/jpeg", jpeg: "image/jpeg", gif: "image/gif", webp: "image/webp",
+    txt: "text/plain;charset=utf-8", htm: "text/plain;charset=utf-8", html: "text/plain;charset=utf-8",
+  };
 
 
   let folders = [];            // [{ id, name, handle, addedAt, lastScanAt }] — every linked folder, always in scope
@@ -132,11 +165,14 @@
   function setHTML(el, html){
     el.innerHTML = ttPolicy ? ttPolicy.createHTML(html) : html;
   }
-  // "default" policy: catches script-URL requests from libraries that aren't Trusted-Types-aware
-  // (pdf.js creating its worker via a plain string). Deliberately omits createHTML — any innerHTML
-  // write that doesn't go through setHTML()/docsearch-html above still gets blocked as before.
+  // "default" policy: pdf.js is not Trusted-Types-aware and starts its worker from a plain string. Only the pdf.js files
+  // of vendor/pdfjs (the worker, and the classic copies used from disk) are let through; any other script URL, script
+  // text (eval, new Function) or innerHTML that doesn't go through setHTML() is still blocked.
   if (window.trustedTypes && trustedTypes.createPolicy){
-    trustedTypes.createPolicy("default", { createScriptURL: s => s, createScript: s => s });
+    const allowed = new Set([PDFJS_WORKER_SRC].concat(PDFJS_CLASSIC).map(u => new URL(u, location.href).href));
+    trustedTypes.createPolicy("default", {
+      createScriptURL: s => { try { return allowed.has(new URL(String(s), location.href).href) ? String(s) : null; } catch (e) { return null; } },
+    });
   }
 
   // Screen-reader announcements (visually hidden live region in index.html).
@@ -840,12 +876,13 @@
   async function viewFile(entry){
     try{
       const file = await entry.handle.getFile();
-      // HTML from the user's folder is shown as source text, never interpreted as a page of this origin.
-      const isHtml = entry.ext === "htm" || entry.ext === "html";
-      const url = URL.createObjectURL(isHtml ? new Blob([file], { type: "text/plain;charset=utf-8" }) : file);
-      // PDFs follow the user's setting (browser viewer, or a download the system opens with its default PDF app).
+      // A preview gets the type of its extension (HTML is shown as source text, never as a page of this origin);
+      // anything else is only downloaded.
       const plan = planOpen(entry.ext, settings);
-      if (plan.action !== "download" && PREVIEWABLE.has(entry.ext)){
+      const preview = plan.action !== "download" && PREVIEWABLE.has(entry.ext);
+      const url = URL.createObjectURL(new Blob([file], { type: preview ? PREVIEW_TYPE[entry.ext] : "application/octet-stream" }));
+      // PDFs follow the user's setting (browser viewer, or a download the system opens with its default PDF app).
+      if (preview){
         window.open(url + plan.hash, "_blank");
       } else {
         const a = document.createElement("a");
@@ -1217,11 +1254,14 @@
 
   async function extractText(entry, file){
     if (entry.ext === "pdf"){
-      if (!window.pdfjsLib || file.size > MAX_PDF_INDEX_SIZE) return null;
+      if (file.size > MAX_PDF_INDEX_SIZE) return null;
+      const pdfjs = await loadPdfjs();
+      if (!pdfjs) return null;
       const buf = await file.arrayBuffer();
-      // isEvalSupported:false disables pdf.js's eval()-based font-loading fast path —
-      // mitigates GHSA-wgrm-67xf-hhpq (arbitrary JS execution via a crafted font in this pdf.js version)
-      const pdf = await pdfjsLib.getDocument({ data: buf, isEvalSupported: false }).promise;
+      // isEvalSupported:false keeps pdf.js off its eval()-based font path (defence in depth; GHSA-wgrm-67xf-hhpq was
+      // fixed in 4.2.67, GHSA-hq66-cqwq-w95j in 6.2.108). Only the text is read: nothing is rendered and no PDF
+      // script runs (scripting belongs to the pdf.js viewer, which is not used).
+      const pdf = await pdfjs.getDocument({ data: buf, isEvalSupported: false }).promise;
       let text = "";
       for (let p = 1; p <= pdf.numPages; p++){
         const page = await pdf.getPage(p);
@@ -1231,6 +1271,7 @@
       return text;
     }
     if (entry.ext === "txt" || entry.ext === "htm" || entry.ext === "html"){
+      if (file.size > MAX_TEXT_INDEX_SIZE) return null;
       return await file.text();
     }
     return null;

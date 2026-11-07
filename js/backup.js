@@ -4,6 +4,10 @@
   const BACKUP_MAX_BYTES = 5 * 1024 * 1024;
   const BACKUP_MAX_FAVORITES = 50000;
   const BACKUP_MAX_COLLECTIONS = 2000;
+  const BACKUP_MAX_PATHS = 50000;        // files in one collection
+  const BACKUP_MAX_PATH_LEN = 4096;      // characters of a relative path (longer than any Windows/macOS path)
+  const BACKUP_MAX_ID_LEN = 128;         // a collection id (ours are 36-character UUIDs)
+  const okPath = p => typeof p === "string" && p.length > 0 && p.length <= BACKUP_MAX_PATH_LEN;
 
   // Pure (no DOM/IndexedDB): validates a backup file and re-targets it at the folders linked HERE.
   // Folder ids are per-browser UUIDs, so a backup from another browser is matched by folder name.
@@ -48,7 +52,7 @@
       const sep = key.indexOf("::");
       const target = sep > 0 ? resolve(key.slice(0, sep)) : null;
       const path = sep > 0 ? key.slice(sep + 2) : "";
-      if (!target || !path || typeof ts !== "number" || !Number.isFinite(ts)){ skipped++; continue; }
+      if (!target || !okPath(path) || typeof ts !== "number" || !Number.isFinite(ts)){ skipped++; continue; }
       favorites[target + "::" + path] = ts;
       targets.add(target);
       favCount++;
@@ -58,20 +62,20 @@
     const cols = [];
     for (const c of data.collections){
       const target = (c && typeof c.folderId === "string") ? resolve(c.folderId) : null;
-      if (!target || typeof c.name !== "string" || !c.name.trim() || !Array.isArray(c.paths)){ skipped++; continue; }
-      let id = (typeof c.id === "string" && c.id && !used.has(c.id)) ? c.id : newId();
+      if (!target || typeof c.name !== "string" || !c.name.trim() || !Array.isArray(c.paths) || c.paths.length > BACKUP_MAX_PATHS){ skipped++; continue; }
+      let id = (typeof c.id === "string" && c.id && c.id.length <= BACKUP_MAX_ID_LEN && !used.has(c.id)) ? c.id : newId();
       used.add(id);
       cols.push({
         id, folderId: target, name: c.name.trim().slice(0, 200),
         createdAt: (typeof c.createdAt === "number" && Number.isFinite(c.createdAt)) ? c.createdAt : Date.now(),
-        paths: c.paths.filter(p => typeof p === "string" && p),
+        paths: c.paths.filter(okPath),
       });
       targets.add(target);
     }
     return { ok: true, favorites, favCount, collections: cols, targets, skipped, skippedFolders: [...skippedFolders] };
   }
 
-  const api = { remapBackup, BACKUP_MAX_BYTES };
+  const api = { remapBackup, BACKUP_MAX_BYTES, BACKUP_MAX_PATHS, BACKUP_MAX_PATH_LEN, BACKUP_MAX_ID_LEN };
   root.DocSearch = root.DocSearch || {};
   root.DocSearch.backup = api;
   if (typeof module !== "undefined" && module.exports) module.exports = api;
