@@ -27,6 +27,12 @@ Most "document search" tools either need a server, an installed app, or send you
 
 Everything runs client side. Your files are read directly from disk by your browser and never leave your machine: file contents, file names, and folder names are never uploaded, and there is no server component that receives them. Search history, favorites, and collections are stored in your browser's IndexedDB, scoped to your browser profile only.
 
+**What stays in the browser after you unlink a folder.** Unlinking deletes that folder's text index and duplicate-detection hashes from IndexedDB. Favorites and collections are kept, so you get them back if you link the same folder again. They can include file names and relative paths, so on a shared computer, remove them from the browser profile with the browser's "Clear site data" if that matters to you.
+
+**What goes over the network.** In the flows our automated test covers (linking a folder, indexing, searching PDF/`.txt`/`.html`, opening a file, exporting, importing a backup), only the site's own expected files were requested, and no URL or request body carried a file name, a folder name, or the text of a document.
+
+**Demo vs. installed app.** The public site (a plain browser tab) is a demo over sample files only. The installed app (see below) lets you pick a real folder, and the browser is what controls that access either way.
+
 No analytics or third-party script runs on the publicly hosted version today; the Content Security Policy allows no script or connection beyond the page's own origin. If that changes (for example, turning on [Cloudflare Web Analytics](https://www.cloudflare.com/web-analytics/) to count page visits), it would still only ever see that the page was loaded, never your files or folders, and the CSP would be updated to name exactly what's allowed (see [DEPLOY.md](DEPLOY.md)).
 
 ## Requirements
