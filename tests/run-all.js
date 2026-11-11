@@ -3,7 +3,7 @@
 const { spawnSync } = require('child_process');
 const path = require('path');
 let bad = 0;
-for (const f of ['unit.js', 'e2e-edge.js']) {
+for (const f of ['unit.js', 'e2e-edge.js', 'e2e-demo.js']) {
   const r = spawnSync(process.execPath, [path.join(__dirname, f)], { encoding: 'utf8', timeout: 300000 });
   const out = (r.stdout || '') + (r.stderr || '');
   const pass = (out.match(/^PASS /gm) || []).length, fail = (out.match(/^FAIL /gm) || []).length;

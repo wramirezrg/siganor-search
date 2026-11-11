@@ -12,6 +12,17 @@
     }
     return;
   }
+  // PWA: the installed app (display-mode: standalone) gets the real folder picker; a plain browser
+  // tab (search.siganor.com visited normally) gets the sample-folders demo instead. See init() below.
+  function isStandalone(){ return matchMedia("(display-mode: standalone)").matches; }
+  let deferredInstallPrompt = null;
+  window.addEventListener("beforeinstallprompt", (e) => {
+    e.preventDefault();
+    deferredInstallPrompt = e;
+    const installBtn = document.getElementById("installBtn");
+    if (installBtn) installBtn.style.display = "";
+  });
+
   const { fold, findSnippet, escapeHtml, escapeAttr, relativeTime, tokenize } = DS.text;
   const { scoreMatch } = DS.ranking;
   const { loadSettings, saveSettings, planOpen } = DS.settings;
@@ -165,15 +176,18 @@
   function setHTML(el, html){
     el.innerHTML = ttPolicy ? ttPolicy.createHTML(html) : html;
   }
-  // "default" policy: pdf.js is not Trusted-Types-aware and starts its worker from a plain string. Only the pdf.js files
-  // of vendor/pdfjs (the worker, and the classic copies used from disk) are let through; any other script URL, script
-  // text (eval, new Function) or innerHTML that doesn't go through setHTML() is still blocked.
+  // "default" policy: pdf.js is not Trusted-Types-aware and starts its worker from a plain string, and
+  // navigator.serviceWorker.register() takes a script URL under the same sink. Only those known, fixed
+  // script URLs are let through; any other script URL, script text (eval, new Function) or innerHTML
+  // that doesn't go through setHTML() is still blocked.
   if (window.trustedTypes && trustedTypes.createPolicy){
-    const allowed = new Set([PDFJS_WORKER_SRC].concat(PDFJS_CLASSIC).map(u => new URL(u, location.href).href));
+    const allowed = new Set([PDFJS_WORKER_SRC, "sw.js"].concat(PDFJS_CLASSIC).map(u => new URL(u, location.href).href));
     trustedTypes.createPolicy("default", {
       createScriptURL: s => { try { return allowed.has(new URL(String(s), location.href).href) ? String(s) : null; } catch (e) { return null; } },
     });
   }
+  // Registered after the "default" Trusted Types policy above, which is what lets this sink accept "sw.js".
+  if ("serviceWorker" in navigator) navigator.serviceWorker.register("sw.js").catch(() => {});
 
   // Screen-reader announcements (visually hidden live region in index.html).
   function announce(msg){
@@ -309,6 +323,63 @@
     }
   }
 
+  // ---------- Demo mode: a virtual folder tree, never a real disk handle ----------
+  // Implements just the subset of FileSystemDirectoryHandle/FileSystemFileHandle that walk()/scanFolder()
+  // use (kind, name, entries(), getFile(), queryPermission()), backed by demo-data/ fetched over HTTP.
+  function demoFileHandle(name, url){
+    return {
+      kind: "file",
+      name,
+      async getFile(){
+        const resp = await fetch(url);
+        const blob = await resp.blob();
+        return new File([blob], name, { type: blob.type, lastModified: Date.now() });
+      },
+    };
+  }
+  function demoDirHandle(name, children){
+    return {
+      kind: "directory",
+      name,
+      async queryPermission(){ return "granted"; },
+      async requestPermission(){ return "granted"; },
+      async *entries(){ for (const entry of children) yield entry; },
+    };
+  }
+  function buildDemoRoot(manifest){
+    const topChildren = manifest.folders.map((f) => {
+      const fileEntries = f.files.map((file) => [file.name, demoFileHandle(file.name, "demo-data/" + encodeURIComponent(f.name) + "/" + encodeURIComponent(file.name))]);
+      return [f.name, demoDirHandle(f.name, fileEntries)];
+    });
+    return demoDirHandle("Demo library", topChildren);
+  }
+
+  async function loadDemo(){
+    setHTML(els.introView, "");
+    els.controlsRow.style.display = "flex";
+    els.layout.style.display = "grid";
+    setStatus("Loading the demo…");
+    try{
+      const manifest = await fetch("demo-data/manifest.json").then((r) => r.json());
+      const rec = { id: "demo", name: "Demo library", handle: buildDemoRoot(manifest), addedAt: Date.now(), lastScanAt: null };
+      folders = [rec];
+      const result = await scanFolder(rec);
+      if (!result.ok){ setStatus("Couldn't load the demo.", true); return; }
+      allFiles = result.files;
+      await loadCollections();
+      groupDuplicates();
+      updateTitle();
+      buildCategoryChips();
+      rememberHeaderHeight();
+      applyFilters();
+      await renderSidebar();
+      await refreshInsights();
+      runIndexQueue();
+    }catch(e){
+      setStatus("Couldn't load the demo: " + e.message, true);
+    }
+  }
+
   async function reconnectFolder(folderId){
     const rec = folders.find(f => f.id === folderId);
     if (!rec) return;
@@ -361,7 +432,7 @@
       els.controlsRow.style.display = "none";
       setHTML(els.chips, "");
       forgetHeaderHeight();
-      renderSelectPrompt();
+      if (isStandalone()) renderSelectPrompt(); else renderDemoPrompt();
       return;
     }
 
@@ -424,6 +495,36 @@
     pickBtn.focus();
   }
 
+  // Plain browser tab (not the installed app): sample folders only, no access to the visitor's real disk.
+  function renderDemoPrompt(){
+    els.layout.style.display = "none";
+    els.indexStatus.style.display = "none";
+    setStatus("");
+    setHTML(els.introView, `
+      <div class="center-panel">
+        <h2>Try the demo</h2>
+        <p>This is a demo with sample folders and documents, so you can see how the search works. Install the app to search your own folders on your computer, fully offline.</p>
+        <div class="picker-actions">
+          <button class="primary" id="demoBtn">▶ Try the demo</button>
+          <button class="primary" id="installBtn" style="display:none;">📥 Install the app</button>
+          <a class="button-like" id="githubLink" href="https://github.com/wramirezrg/siganor-search" target="_blank" rel="noopener noreferrer">⭐ View on GitHub</a>
+        </div>
+        <p class="fine-print">🔒 The demo never touches your real files. Installed, the app still never uploads anything.</p>
+      </div>`);
+    const demoBtn = document.getElementById("demoBtn");
+    demoBtn.onclick = loadDemo;
+    demoBtn.focus();
+    const installBtn = document.getElementById("installBtn");
+    installBtn.style.display = deferredInstallPrompt ? "" : "none";
+    installBtn.onclick = async () => {
+      if (!deferredInstallPrompt) return;
+      deferredInstallPrompt.prompt();
+      await deferredInstallPrompt.userChoice;
+      deferredInstallPrompt = null;
+      installBtn.style.display = "none";
+    };
+  }
+
   function setStatus(msg, isErr){
     els.status.textContent = msg || "";
     els.status.className = isErr ? "err" : "";
@@ -474,7 +575,7 @@
         f.folderName = rec.name;
       });
       rec.lastScanAt = Date.now();
-      await idbSet(STORE_FOLDERS, rec.id, rec);
+      await idbSet(STORE_FOLDERS, rec.id, rec).catch(() => {}); // demo folders hold a virtual handle, not structured-cloneable
       folderPermissionState.set(rec.id, "granted");
       return { ok: true, files };
     }catch(e){
@@ -1841,6 +1942,12 @@
 
   // ---------- Startup ----------
   async function init(){
+    // Installed app (standalone window) gets the real picker; a plain browser tab gets the demo.
+    // This is a UX signal, not a security boundary: the real folder permission below is the actual gate.
+    if (!isStandalone()){
+      renderDemoPrompt();
+      return;
+    }
     if (!("showDirectoryPicker" in window)){
       renderUnsupported();
       return;
