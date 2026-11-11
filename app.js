@@ -72,6 +72,7 @@
   const TEXT_INDEXABLE = new Set(["pdf","txt","htm","html"]);
   const MAX_PDF_INDEX_SIZE = 40 * 1024 * 1024; // skip huge PDFs (likely image scans, or pathologically slow)
   const MAX_TEXT_INDEX_SIZE = 20 * 1024 * 1024; // .txt/.html larger than this are found by name only (memory and IndexedDB)
+  const MAX_HASH_SIZE = 200 * 1024 * 1024; // skip hashing files this large for duplicate detection (still found by name); avoids reading a huge file fully into memory
 
   const PREVIEWABLE = new Set(["pdf","png","jpg","jpeg","gif","webp","txt","htm","html"]);
   // The type of a preview is set here, never guessed by the browser from the file: text stays text, HTML is shown as source.
@@ -1518,6 +1519,7 @@
     for (const item of toHash){
       if (scanGeneration !== myGeneration){ hashingActive = false; return; }
       const { entry } = item;
+      if (item.size > MAX_HASH_SIZE){ hashQueueDone++; updateStatusLine(); continue; }
       try{
         const key = fileKey(entry);
         const cached = hashIndex.get(key);

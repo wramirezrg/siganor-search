@@ -27,7 +27,7 @@ Most "document search" tools either need a server, an installed app, or send you
 
 Everything runs client side. Your files are read directly from disk by your browser and never leave your machine: file contents, file names, and folder names are never uploaded, and there is no server component that receives them. Search history, favorites, and collections are stored in your browser's IndexedDB, scoped to your browser profile only.
 
-The publicly hosted version uses [Cloudflare Web Analytics](https://www.cloudflare.com/web-analytics/) to count page visits (cookieless, no personal profiles). That measurement only sees that the page was loaded; it never has access to your files or folders. A copy you host yourself doesn't include it unless you add it.
+No analytics or third-party script runs on the publicly hosted version today; the Content Security Policy allows no script or connection beyond the page's own origin. If that changes (for example, turning on [Cloudflare Web Analytics](https://www.cloudflare.com/web-analytics/) to count page visits), it would still only ever see that the page was loaded, never your files or folders, and the CSP would be updated to name exactly what's allowed (see [DEPLOY.md](DEPLOY.md)).
 
 ## Requirements
 
