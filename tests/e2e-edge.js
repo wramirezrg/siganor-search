@@ -86,6 +86,8 @@ const server = http.createServer((req, res) => {
         return dir;
       })();
       window.showDirectoryPicker = function () { return window.__synth; };
+      // The real-folder flow is gated behind the installed app (display-mode: standalone); simulate that here.
+      window.matchMedia = function (q) { return { matches: /display-mode:\\s*standalone/.test(q), media: q, addListener(){}, removeListener(){}, addEventListener(){}, removeEventListener(){} }; };
       window.confirm = function () { return true; };
       window.__opened = []; window.open = function (u) { window.__opened.push(String(u)); return null; };
       window.__blobTypes = []; var cou = URL.createObjectURL; URL.createObjectURL = function (b) { window.__blobTypes.push(b && b.type); return cou.call(URL, b); };
@@ -132,7 +134,7 @@ const server = http.createServer((req, res) => {
     const leaks = requests.filter((r) => secrets.some((s) => (decodeURIComponent(r.url) + ' ' + r.post).toLowerCase().includes(s)));
     t('no URL or request body carries a file name, the folder name or the text of a file', leaks.length === 0, leaks.map((r) => r.url).join(' | '));
     const fetched = [...new Set(requests.filter((r) => r.url.startsWith(ORIGIN)).map((r) => r.url.slice(ORIGIN.length)))];
-    t('only the app files are requested (pdf.js and its worker included)', fetched.every((u) => /^\/(index\.html)?$|^\/(app\.js|favicon\.ico|js\/[\w-]+\.js|img\/[\w.-]+|vendor\/pdfjs\/pdf(\.worker)?\.min\.mjs)$/.test(u)) && fetched.includes('/vendor/pdfjs/pdf.worker.min.mjs'), fetched.join(' '));
+    t('only the app files are requested (pdf.js and its worker included)', fetched.every((u) => /^\/(index\.html)?$|^\/(app\.js|favicon\.ico|manifest\.json|sw\.js|js\/[\w-]+\.js|img\/[\w.-]+|vendor\/pdfjs\/(pdf|pdf\.worker)(\.min\.mjs|\.classic\.js))$/.test(u)) && fetched.includes('/vendor/pdfjs/pdf.worker.min.mjs'), fetched.join(' '));
     const csp = await ev('JSON.stringify(window.__csp)');
     t('no Content Security Policy or Trusted Types violation', csp === '[]' && !errors.some((e) => /TrustedScript|Content Security Policy|Refused/i.test(e)), csp + ' ' + errors.join(' | '));
     console.log('info: requests seen: ' + requests.length + ' (all same-origin app files), ' + fetched.join(' '));

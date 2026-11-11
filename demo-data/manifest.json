@@ -1,0 +1,117 @@
+{
+  "folders": [
+    {
+      "name": "Recipes",
+      "files": [
+        {
+          "name": "pasta-notes.txt"
+        },
+        {
+          "name": "bread-starter.html"
+        },
+        {
+          "name": "soup-ideas.pdf"
+        }
+      ]
+    },
+    {
+      "name": "Project Nimbus",
+      "files": [
+        {
+          "name": "weekly-status.txt"
+        },
+        {
+          "name": "architecture-notes.html"
+        }
+      ]
+    },
+    {
+      "name": "Project Atlas",
+      "files": [
+        {
+          "name": "weekly-status.txt"
+        },
+        {
+          "name": "budget.pdf"
+        }
+      ]
+    },
+    {
+      "name": "Meeting notes",
+      "files": [
+        {
+          "name": "2026-02-03-standup.txt"
+        },
+        {
+          "name": "quarterly-review.html"
+        }
+      ]
+    },
+    {
+      "name": "Travel planning",
+      "files": [
+        {
+          "name": "lisbon-itinerary.txt"
+        },
+        {
+          "name": "packing-list.txt"
+        }
+      ]
+    },
+    {
+      "name": "Book notes",
+      "files": [
+        {
+          "name": "dune-notes.html"
+        },
+        {
+          "name": "reading-list.txt"
+        }
+      ]
+    },
+    {
+      "name": "Home maintenance",
+      "files": [
+        {
+          "name": "furnace-filter.txt"
+        },
+        {
+          "name": "paint-colors.txt"
+        }
+      ]
+    },
+    {
+      "name": "Garden log",
+      "files": [
+        {
+          "name": "spring-planting.pdf"
+        },
+        {
+          "name": "watering-schedule.txt"
+        }
+      ]
+    },
+    {
+      "name": "Budget planning",
+      "files": [
+        {
+          "name": "monthly-budget.txt"
+        },
+        {
+          "name": "emergency-fund.html"
+        }
+      ]
+    },
+    {
+      "name": "Workout log",
+      "files": [
+        {
+          "name": "week-12.txt"
+        },
+        {
+          "name": "stretching-routine.txt"
+        }
+      ]
+    }
+  ]
+}

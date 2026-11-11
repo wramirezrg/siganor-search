@@ -1,0 +1,4 @@
+Weekly status update
+Migration to the new queue is on track for Friday.
+Two open bugs in the retry logic, owner: backend team.
+Next milestone: load test at 2x current traffic.

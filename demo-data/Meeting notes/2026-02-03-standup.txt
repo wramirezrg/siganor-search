@@ -1,0 +1,4 @@
+Standup notes
+Maria: finished the onboarding flow, starting QA.
+Diego: blocked on the vendor API, filed a support ticket.
+Action: follow up with vendor by Thursday.
